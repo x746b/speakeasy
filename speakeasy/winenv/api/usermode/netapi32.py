@@ -124,6 +124,34 @@ class NetApi32(api.ApiHandler):
 
         return netapi32defs.NERR_Success
 
+    @apihook("NetUserSetInfo", argc=5)
+    def NetUserSetInfo(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        NET_API_STATUS NET_API_FUNCTION NetUserSetInfo(
+          LPCWSTR servername,
+          LPCWSTR username,
+          DWORD   level,
+          LPBYTE  buf,
+          LPDWORD parm_err
+        );
+        """
+        servername, username, level, buf, parm_err = argv
+
+        if servername:
+            argv[0] = self.read_wide_string(servername)
+
+        if username:
+            argv[1] = self.read_wide_string(username)
+
+        if level == 1003 and buf:
+            ptr_size = emu.get_ptr_size()
+            password_ptr = int.from_bytes(self.mem_read(buf, ptr_size), "little")
+            if password_ptr:
+                password = self.read_mem_string(password_ptr, width=2)
+                argv[3] = f"USER_INFO_1003(password={password})"
+
+        return netapi32defs.NERR_Success
+
     @apihook("NetApiBufferFree", argc=1)
     def NetApiBufferFree(self, emu, argv, ctx: api.ApiContext = None):
         """

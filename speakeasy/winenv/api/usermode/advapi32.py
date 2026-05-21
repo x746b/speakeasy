@@ -276,6 +276,49 @@ class AdvApi32(api.ApiHandler):
 
         return windefs.ERROR_SUCCESS
 
+    @apihook("RegSetKeyValueA", argc=6, conv=_arch.CALL_CONV_STDCALL)
+    def RegSetKeyValueA(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        LSTATUS RegSetKeyValueA(
+          HKEY       hKey,
+          LPCSTR     lpSubKey,
+          LPCSTR     lpValueName,
+          DWORD      dwType,
+          LPCVOID    lpData,
+          DWORD      cbData
+        );
+        """
+        hKey, lpSubKey, lpValueName, dwType, lpData, cbData = argv
+
+        if lpSubKey:
+            argv[1] = self.read_mem_string(lpSubKey, 1)
+
+        if lpValueName:
+            argv[2] = self.read_mem_string(lpValueName, 1)
+
+        data = b""
+        if lpData and cbData:
+            data = self.mem_read(lpData, cbData)
+
+        key_path = argv[1] or ""
+        root_path = regdefs.get_hkey_type(hKey)
+        if root_path and key_path:
+            key_path = f"{root_path}\\{key_path}"
+        elif root_path:
+            key_path = root_path
+
+        self.record_registry_access_event(
+            key_path,
+            REG_WRITE,
+            value_name=argv[2] or "",
+            data=data,
+            handle=hKey,
+            size=cbData,
+            buffer=lpData,
+        )
+
+        return windefs.ERROR_SUCCESS
+
     @apihook("RegCloseKey", argc=1, conv=_arch.CALL_CONV_STDCALL)
     def RegCloseKey(self, emu, argv, ctx: api.ApiContext = None):
         """
