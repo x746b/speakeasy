@@ -9,7 +9,6 @@ MEM_WRITE = "mem_write"
 MEM_READ = "mem_read"
 MEM_PROTECT = "mem_protect"
 MEM_FREE = "mem_free"
-MODULE_LOAD = "module_load"
 THREAD_INJECT = "thread_inject"
 THREAD_CREATE = "thread_create"
 
@@ -27,12 +26,8 @@ REG_LIST = "reg_list_subkeys"
 REG_CREATE = "reg_create_key"
 
 # network events
-NET_DNS = "net_dns"
-NET_TRAFFIC = "net_traffic"
-NET_HTTP = "net_http"
 
 # exception events
-EXCEPTION = "exception"
 
 # api events
 API = "api"
@@ -92,6 +87,36 @@ class Event(BaseModel):
     event: str = Field(description=("Event type discriminator.\n\nDetermines which concrete payload schema applies."))
 
 
+class ApiArg(BaseModel):
+    """One argument of an API call, as passed by the caller and as shown in the trace."""
+
+    name: str | None = Field(
+        default=None,
+        description="Parameter name from the API signature. Absent when the signature is not known.",
+    )
+    type: str = Field(
+        description=(
+            "How to read ``display``: "
+            "``int`` (hex), ``ptr`` (address, hex), ``handle`` (hex), ``str`` (decoded string, unquoted), "
+            "``bool`` (TRUE or FALSE), ``enum`` (a member name), "
+            "``flags`` (member names joined by ``|``, maybe with a hex remainder), "
+            "``struct`` (``{field: value, ...}`` display text, not JSON), ``bytes`` (hex dump), "
+            "``guid``, ``float`` (decimal), or ``text`` (a value decoded by a handler)."
+        )
+    )
+    value: int | None = Field(
+        default=None,
+        description=(
+            "Raw value as the caller passed it. "
+            "A parameter that uses more than one argument slot has the combined value. "
+            "A floating point argument that Win64 passes in an XMM register has the value of the "
+            "integer register for the same position instead. "
+            "Absent for an entry that a handler adds, such as the formatted output of a printf call."
+        ),
+    )
+    display: str = Field(description="Human readable rendering of the argument.")
+
+
 class ApiEvent(Event):
     """Records one intercepted API invocation.
 
@@ -108,10 +133,10 @@ class ApiEvent(Event):
             "Used for behavior signatures, clustering, and family comparison."
         )
     )
-    args: list[str] = Field(
+    args: list[ApiArg] = Field(
         description=(
-            "Formatted argument values captured for the call.\n\n"
-            "Integers are typically represented in hexadecimal string form."
+            "Arguments of the call. With a usable API signature there is one entry per parameter; "
+            "otherwise one entry per argument slot, plus any entries a variadic handler adds."
         )
     )
     ret_val: str | None = Field(
@@ -145,6 +170,12 @@ class ProcessCreateEvent(Event):
             "Command line used for process creation.\n\nUse this to recover execution parameters and staged arguments."
         )
     )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) creates this process; the target may differ."
+        ),
+    )
 
 
 class MemAllocEvent(Event):
@@ -162,6 +193,13 @@ class MemAllocEvent(Event):
     protect: str | None = Field(
         default=None,
         description="Requested memory protection flags, when provided by the API path.",
+    )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) allocates in this process; NULL when the "
+            "target is the actor itself."
+        ),
     )
 
 
@@ -182,6 +220,13 @@ class MemWriteEvent(Event):
         default=None,
         description=("Reference into the top-level report ``data`` store for the captured write preview bytes."),
     )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) writes into this process; NULL when the "
+            "target is the actor itself."
+        ),
+    )
 
 
 class MemReadEvent(Event):
@@ -200,6 +245,13 @@ class MemReadEvent(Event):
     data_ref: str | None = Field(
         default=None,
         description="Reference into the top-level report ``data`` store for the captured read preview bytes.",
+    )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) reads from this process; NULL when the "
+            "target is the actor itself."
+        ),
     )
 
 
@@ -222,6 +274,13 @@ class MemProtectEvent(Event):
         default=None,
         description="New protection value requested by the API call.",
     )
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) changes protection in this process; NULL when "
+            "the target is the actor itself."
+        ),
+    )
 
 
 class MemFreeEvent(Event):
@@ -236,6 +295,13 @@ class MemFreeEvent(Event):
     path: str = Field(description="Target process path associated with the free event.")
     base: str = Field(description="Freed region base address in hexadecimal string form.")
     size: str = Field(description="Freed region size in hexadecimal string form.")
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) frees memory in this process; NULL when the "
+            "target is the actor itself."
+        ),
+    )
 
 
 class ModuleLoadEvent(Event):
@@ -269,6 +335,17 @@ class ThreadCreateEvent(Event):
     path: str = Field(description="Target process path where the thread is created.")
     start_addr: str = Field(description="Thread start address in hexadecimal string form.")
     param: str = Field(description="Thread parameter pointer/value in hexadecimal string form.")
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier.\n\nThe actor (event pos) creates the thread in this process; NULL when "
+            "the target is the actor itself."
+        ),
+    )
+    tid: int | None = Field(
+        default=None,
+        description="Target thread identifier of the newly created thread, when known.",
+    )
 
 
 class ThreadInjectEvent(Event):
@@ -286,6 +363,16 @@ class ThreadInjectEvent(Event):
     path: str = Field(description="Target process path receiving the injected thread.")
     start_addr: str = Field(description="Injected thread start address in hexadecimal string form.")
     param: str = Field(description="Injected thread parameter in hexadecimal string form.")
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "Target process identifier receiving the injected thread.\n\nNULL when the target is the actor itself."
+        ),
+    )
+    tid: int | None = Field(
+        default=None,
+        description="Target thread identifier of the injected thread, when known.",
+    )
 
 
 class FileCreateEvent(Event):

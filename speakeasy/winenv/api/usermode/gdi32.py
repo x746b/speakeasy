@@ -1,6 +1,10 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import struct
+
 from .. import api
+
+MAX_DIB_SIZE = 0x8000000
 
 
 class GDI32(api.ApiHandler):
@@ -13,7 +17,6 @@ class GDI32(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -28,7 +31,7 @@ class GDI32(api.ApiHandler):
         return hnd
 
     @apihook("CreateBitmap", argc=5)
-    def CreateBitmap(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateBitmap(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HBITMAP CreateBitmap(
             int        nWidth,
@@ -40,8 +43,8 @@ class GDI32(api.ApiHandler):
         """
         return self.get_handle()
 
-    @apihook("MoveToEx", argc=1)
-    def MoveToEx(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("MoveToEx", argc=4)
+    def MoveToEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL MoveToEx(
           HDC     hdc,
@@ -52,8 +55,8 @@ class GDI32(api.ApiHandler):
         """
         return 1
 
-    @apihook("LineTo", argc=1)
-    def LineTo(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("LineTo", argc=3)
+    def LineTo(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL LineTo(
           HDC hdc,
@@ -64,7 +67,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("GetStockObject", argc=1)
-    def GetStockObject(self, emu, argv, ctx: api.ApiContext = None):
+    def GetStockObject(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGDIOBJ GetStockObject(
             int i
@@ -73,7 +76,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("GetMapMode", argc=1)
-    def GetMapMode(self, emu, argv, ctx: api.ApiContext = None):
+    def GetMapMode(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetMapMode(
             HDC hdc
@@ -82,7 +85,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("GetDeviceCaps", argc=2)
-    def GetDeviceCaps(self, emu, argv, ctx: api.ApiContext = None):
+    def GetDeviceCaps(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetDeviceCaps(
             HDC hdc,
@@ -92,7 +95,7 @@ class GDI32(api.ApiHandler):
         return 16
 
     @apihook("GdiSetBatchLimit", argc=1)
-    def GdiSetBatchLimit(self, emu, argv, ctx: api.ApiContext = None):
+    def GdiSetBatchLimit(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GdiSetBatchLimit(
           DWORD dw
@@ -101,7 +104,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("MaskBlt", argc=12)
-    def MaskBlt(self, emu, argv, ctx: api.ApiContext = None):
+    def MaskBlt(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL MaskBlt(
           HDC     hdcDest,
@@ -121,7 +124,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("BitBlt", argc=9)
-    def BitBlt(self, emu, argv, ctx: api.ApiContext = None):
+    def BitBlt(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL BitBlt(
         HDC   hdc,
@@ -137,7 +140,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("DeleteDC", argc=1)
-    def DeleteDC(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteDC(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DeleteDC(
         HDC hdc
@@ -146,7 +149,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("SelectObject", argc=2)
-    def SelectObject(self, emu, argv, ctx: api.ApiContext = None):
+    def SelectObject(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGDIOBJ SelectObject(
           HDC     hdc,
@@ -156,7 +159,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("DeleteObject", argc=1)
-    def DeleteObject(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteObject(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DeleteObject(
         HGDIOBJ ho
@@ -165,7 +168,7 @@ class GDI32(api.ApiHandler):
         return 1
 
     @apihook("CreateCompatibleBitmap", argc=3)
-    def CreateCompatibleBitmap(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateCompatibleBitmap(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HBITMAP CreateCompatibleBitmap(
         HDC hdc,
@@ -176,16 +179,16 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("CreateCompatibleDC", argc=1)
-    def CreateCompatibleDC(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateCompatibleDC(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HDC CreateCompatibleDC(
         HDC hdc
         );
         """
-        return 0
+        return self.get_handle()
 
     @apihook("GetDIBits", argc=7)
-    def GetDIBits(self, emu, argv, ctx: api.ApiContext = None):
+    def GetDIBits(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetDIBits(
         HDC          hdc,
@@ -200,7 +203,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("CreateDIBSection", argc=6)
-    def CreateDIBSection(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateDIBSection(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HBITMAP CreateDIBSection(
           [in]  HDC              hdc,
@@ -211,10 +214,20 @@ class GDI32(api.ApiHandler):
           [in]  DWORD            offset
         );
         """
-        return 0
+        hdc, pbmi, usage, ppvBits, hSection, offset = argv
+        width, height, _, bit_count = struct.unpack("<iiHH", self.mem_read(pbmi + 4, 12))
+        bits = 0
+        hbm = 0
+        size = (width * bit_count + 31) // 32 * 4 * abs(height)
+        if width > 0 and height != 0 and bit_count in (1, 4, 8, 16, 24, 32) and size <= MAX_DIB_SIZE:
+            bits = self.mem_alloc(size, tag="api.gdi32.CreateDIBSection")
+            hbm = self.get_handle()
+        if ppvBits:
+            self.mem_write(ppvBits, bits.to_bytes(emu.get_ptr_size(), "little"))
+        return hbm
 
     @apihook("CreateDCA", argc=4)
-    def CreateDCA(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateDCA(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HDC CreateDCA(
         LPCSTR         pwszDriver,
@@ -226,7 +239,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("GetTextCharacterExtra", argc=1)
-    def GetTextCharacterExtra(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTextCharacterExtra(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetTextCharacterExtra(
           HDC hdc
@@ -235,7 +248,7 @@ class GDI32(api.ApiHandler):
         return 0x8000000
 
     @apihook("StretchBlt", argc=11)
-    def StretchBlt(self, emu, argv, ctx: api.ApiContext = None):
+    def StretchBlt(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL StretchBlt(
           HDC   hdcDest,
@@ -254,7 +267,7 @@ class GDI32(api.ApiHandler):
         return 0
 
     @apihook("CreateFontIndirectA", argc=1)
-    def CreateFontIndirectA(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateFontIndirectA(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HFONT CreateFontIndirectA(
             const LOGFONTA *lplf
@@ -265,7 +278,7 @@ class GDI32(api.ApiHandler):
         return 0x6000
 
     @apihook("GetObjectA", argc=3)
-    def GetObjectA(self, emu, argv, ctx: api.ApiContext = None):
+    def GetObjectA(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetObjectA(
             HANDLE h,
@@ -283,7 +296,7 @@ class GDI32(api.ApiHandler):
                     emu.mem_write(pv, data)
                 except Exception:
                     base_addr = pv & ~0xFFF
-                    emu.mem_map(base_addr, 0x1000)
+                    emu.mem_map(0x1000, base=base_addr)
                     emu.mem_write(pv, data)
             except Exception:
                 pass
@@ -292,7 +305,7 @@ class GDI32(api.ApiHandler):
         return c
 
     @apihook("WidenPath", argc=1)
-    def WidenPath(self, emu, argv, ctx: api.ApiContext = None):
+    def WidenPath(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL WidenPath(
             HDC hdc

@@ -10,6 +10,7 @@ DEFAULT_CONFIG_DATA = {
     "description": "Default emulation profile to use when not overridden by user",
     "emu_engine": "unicorn",
     "timeout": 60,
+    "max_total_time": 0,
     "max_api_count": 10000,
     "stack_size": 0,
     "system": "windows",
@@ -162,8 +163,6 @@ DEFAULT_CONFIG_DATA = {
     "modules": {
         "modules_always_exist": False,
         "functions_always_exist": False,
-        "module_directory_x86": "$ROOT$/winenv/decoys/x86",
-        "module_directory_x64": "$ROOT$/winenv/decoys/amd64",
         "system_modules": [
             {"name": "ntoskrnl", "base_addr": "0x803d0000", "path": "C:\\Windows\\system32\\ntoskrnl.exe"},
             {"name": "hal", "base_addr": "0xC1000000", "path": "C:\\Windows\\system32\\hal.dll"},
@@ -239,6 +238,7 @@ DEFAULT_CONFIG_DATA = {
                 "base_addr": "0x60000000",
                 "path": "C:\\Windows\\system32\\bcryptprimitives.dll",
             },
+            {"name": "version", "base_addr": "0x60100000", "path": "C:\\Windows\\system32\\version.dll"},
         ],
     },
 }
@@ -498,8 +498,12 @@ class ModulesConfig(BaseModel):
         default=False, description="Synthesize unknown modules instead of failing loads."
     )
     functions_always_exist: bool = Field(default=False, description="Treat unresolved imports as existing stubs.")
-    module_directory_x86: str | None = Field(default=None, description="Search path for x86 decoy modules.")
-    module_directory_x64: str | None = Field(default=None, description="Search path for x64 decoy modules.")
+    module_directory_x86: str | None = Field(
+        default=None, description="Directory of x86 DLLs to load instead of synthetic API modules."
+    )
+    module_directory_x64: str | None = Field(
+        default=None, description="Directory of x64 DLLs to load instead of synthetic API modules."
+    )
     user_modules: list[UserModuleConfig] = Field(
         default_factory=list, description="Configured user-mode module inventory."
     )
@@ -529,7 +533,16 @@ class SpeakeasyConfig(BaseModel):
     emu_engine: Literal["unicorn"] = Field(
         default=DEFAULT_CONFIG_DATA["emu_engine"], description="Emulation backend identifier."
     )
-    timeout: float = Field(default=DEFAULT_CONFIG_DATA["timeout"], description="Emulation timeout in seconds.")
+    timeout: float = Field(
+        default=DEFAULT_CONFIG_DATA["timeout"],
+        description="Active execution timeout in seconds per Run. 0 disables it.",
+    )
+    max_total_time: float = Field(
+        default=DEFAULT_CONFIG_DATA["max_total_time"],
+        ge=0,
+        allow_inf_nan=False,
+        description="Maximum active execution seconds per public invocation, across all runs. 0 disables this cap.",
+    )
     max_api_count: int = Field(
         default=DEFAULT_CONFIG_DATA["max_api_count"], description="Maximum API calls allowed per run."
     )

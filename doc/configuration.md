@@ -18,9 +18,13 @@ The example below is JSONC (JSON with comments). Remove comment lines for machin
   // Emulation backend. Only "unicorn" is currently supported.
   "emu_engine": "unicorn",
 
-  // Wall-clock timeout in seconds for each emulation session.
+  // Active execution timeout in seconds for each run. 0 disables it.
   // Raise for slow/staged samples. Lower for quick triage.
   "timeout": 60,
+
+  // Active execution cap in seconds across all runs of one run_module,
+  // run_shellcode, or call invocation. 0 disables it.
+  "max_total_time": 0,
 
   // Per-run API call cap. If exceeded, the run ends with a max_api_count error.
   // Raise to allow very API-heavy behavior; lower to cut anti-analysis loops earlier.
@@ -61,7 +65,7 @@ The example below is JSONC (JSON with comments). Remove comment lines for machin
   "snapshot_memory_regions": false,
 
   "exceptions": {
-    // If true, emulate exception-handler dispatch (SEH/VEH-like paths).
+    // If true, emulate exception-handler dispatch (SEH/VEH-like paths, see exceptions.md).
     // If false, faulting paths stop sooner and are easier to localize.
     "dispatch_handlers": true
   },
@@ -316,15 +320,20 @@ The example below is JSONC (JSON with comments). Remove comment lines for machin
   ],
 
   "modules": {
-    // If true, unknown module loads synthesize decoys instead of failing.
+    // If true, loads of unknown modules create empty synthetic API modules
+    // instead of failing.
     "modules_always_exist": false,
 
-    // If true, unresolved API imports are treated as existing stubs.
+    // If true, unresolved API imports that are in neither the handlers nor the
+    // bundled signature database resolve to dynamic entries that act as stubs
+    // (4 stdcall arguments, return value 1). Imports with a known signature are
+    // always emulated from it, see doc/api-handlers.md.
     "functions_always_exist": false,
 
-    // Decoy search roots by architecture.
-    "module_directory_x86": "$ROOT$/winenv/decoys/x86",
-    "module_directory_x64": "$ROOT$/winenv/decoys/amd64",
+    // Directories of native DLLs, by architecture. A module with a matching
+    // file name loads from the directory instead of as a synthetic API module.
+    "module_directory_x86": null,
+    "module_directory_x64": null,
 
     // User-mode module inventory.
     "user_modules": [

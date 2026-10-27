@@ -2,6 +2,8 @@
 
 import ntpath
 
+import speakeasy.winenv.defs.windows.windows as windefs
+
 from .. import api
 
 
@@ -11,11 +13,15 @@ class Psapi(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
         self.funcs = {}
         self.data = {}
         super().__get_hook_attrs__(self)
+
+    def _get_process(self, hProcess):
+        if hProcess == self.get_max_int():
+            return self.emu.get_current_process()
+        return self.get_object_from_handle(hProcess)
 
     def _get_process_module_bases(self, proc):
         proc_module = proc.pe
@@ -53,14 +59,13 @@ class Psapi(api.ApiHandler):
         return proc.path or ""
 
     @apihook("EnumProcesses", argc=3)
-    def EnumProcesses(self, emu, argv, ctx: api.ApiContext = None):
+    def EnumProcesses(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         lpidProcess, cb, lpcbNeeded = argv
         processes = emu.get_processes()
 
-        if lpcbNeeded:
-            self.mem_write(lpcbNeeded, (len(processes) * 4).to_bytes(4, "little"))
-
         if not lpidProcess or cb < 4:
+            if lpcbNeeded:
+                self.mem_write(lpcbNeeded, (len(processes) * 4).to_bytes(4, "little"))
             return 1
 
         count = min(cb // 4, len(processes))
@@ -70,12 +75,15 @@ class Psapi(api.ApiHandler):
             self.mem_write(cursor, int(pid).to_bytes(4, "little"))
             cursor += 4
 
+        if lpcbNeeded:
+            self.mem_write(lpcbNeeded, (count * 4).to_bytes(4, "little"))
+
         return 1
 
     @apihook("EnumProcessModules", argc=4)
-    def EnumProcessModules(self, emu, argv, ctx: api.ApiContext = None):
+    def EnumProcessModules(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         hProcess, lphModule, cb, lpcbNeeded = argv
-        proc = self.get_object_from_handle(hProcess)
+        proc = self._get_process(hProcess)
         if not proc:
             return 0
 
@@ -96,16 +104,17 @@ class Psapi(api.ApiHandler):
 
         return 1
 
+    @apihook("EnumProcessModulesEx", argc=5)
+    def EnumProcessModulesEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        return self.EnumProcessModules(emu, argv[:4], ctx)
+
     @apihook("GetModuleBaseName", argc=4)
-    @apihook("GetModuleBaseNameA", argc=4)
-    @apihook("GetModuleBaseNameW", argc=4)
-    def GetModuleBaseName(self, emu, argv, ctx: api.ApiContext = None):
-        ctx = ctx or {}
+    def GetModuleBaseName(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         hProcess, hModule, lpBaseName, nSize = argv
         if not lpBaseName or nSize == 0:
             return 0
 
-        proc = self.get_object_from_handle(hProcess)
+        proc = self._get_process(hProcess)
         if not proc:
             return 0
 
@@ -128,15 +137,12 @@ class Psapi(api.ApiHandler):
         return len(truncated)
 
     @apihook("GetModuleFileNameEx", argc=4)
-    @apihook("GetModuleFileNameExA", argc=4)
-    @apihook("GetModuleFileNameExW", argc=4)
-    def GetModuleFileNameEx(self, emu, argv, ctx: api.ApiContext = None):
-        ctx = ctx or {}
+    def GetModuleFileNameEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         hProcess, hModule, lpFilename, nSize = argv
         if not lpFilename or nSize == 0:
             return 0
 
-        proc = self.get_object_from_handle(hProcess)
+        proc = self._get_process(hProcess)
         if not proc:
             return 0
 
@@ -157,3 +163,31 @@ class Psapi(api.ApiHandler):
 
         self.mem_write(lpFilename, output)
         return len(truncated)
+
+    @apihook("GetModuleInformation", argc=4)
+    def GetModuleInformation(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL GetModuleInformation(
+          HANDLE       hProcess,
+          HMODULE      hModule,
+          LPMODULEINFO lpmodinfo,
+          DWORD        cb
+        );
+        """
+        hProcess, hModule, lpmodinfo, cb = argv
+        ptr_size = self.get_ptr_size()
+        if cb < ptr_size * 3:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+
+        proc = self._get_process(hProcess)
+        if proc and not hModule:
+            hModule = next(iter(self._get_process_module_bases(proc)), 0)
+        mod = emu.get_mod_from_addr(hModule) if proc else None
+        if not mod or mod.base != hModule:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        info = b"".join(v.to_bytes(ptr_size, "little") for v in (mod.base, mod.image_size, mod.get_ep()))
+        self.mem_write(lpmodinfo, info)
+        return 1

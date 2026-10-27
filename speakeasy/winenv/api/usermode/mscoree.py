@@ -13,7 +13,6 @@ class Mscoree(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -22,7 +21,7 @@ class Mscoree(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("CorExitProcess", argc=1)
-    def CorExitProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def CorExitProcess(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void STDMETHODCALLTYPE CorExitProcess (
             int  exitCode

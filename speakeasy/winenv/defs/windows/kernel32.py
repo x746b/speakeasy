@@ -20,8 +20,15 @@ TH32CS_SNAPMODULE32 = 0x00000010
 TH32CS_SNAPPROCESS = 0x00000002
 TH32CS_SNAPTHREAD = 0x00000004
 
+GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004
+
+INIT_ONCE_CHECK_ONLY = 0x00000001
+
 PROCESSOR_ARCHITECTURE_AMD64 = 9
 PROCESSOR_ARCHITECTURE_INTEL = 0
+
+PROCESSOR_INTEL_PENTIUM = 586
+PROCESSOR_AMD_X8664 = 8664
 
 LOCALE_INVARIANT = 0x7F
 LOCALE_USER_DEFAULT = 0x400
@@ -96,7 +103,7 @@ class MODULEENTRY32(EmuStruct):
         self.ProccntUsage = ct.c_uint32
         self.modBaseAddr = Ptr
         self.modBaseSize = ct.c_uint32
-        self.hModule = ct.c_uint32
+        self.hModule = Ptr
         self.szModule = ct.c_uint8 * ((MAX_MODULE_NAME32 + 1) * width)
         self.szExePath = ct.c_uint8 * (MAX_PATH * width)
 

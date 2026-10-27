@@ -53,22 +53,37 @@ class RegValue:
     def get_data(self):
         return self.data
 
+    def get_bytes(self, width):
+        """
+        Get the data as the registry APIs return it, with strings encoded in
+        characters of ``width`` bytes.
+        """
+        enc = "utf-16le" if width == 2 else "utf-8"
+        if self.type in (regdefs.REG_SZ, regdefs.REG_EXPAND_SZ):
+            return (self.data + "\x00").encode(enc)
+        if self.type == regdefs.REG_MULTI_SZ:
+            return (self.data + "\x00\x00").encode(enc)
+        if self.type == regdefs.REG_DWORD and isinstance(self.data, int):
+            return (self.data & 0xFFFFFFFF).to_bytes(4, "little")
+        if self.type == regdefs.REG_QWORD and isinstance(self.data, int):
+            return (self.data & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+        if self.type == regdefs.REG_BINARY:
+            return base64.b64decode(self.data)
+        return self.data if isinstance(self.data, bytes) else b""
+
 
 class RegKey:
     """
     Represents a registry key
     """
 
-    curr_handle = 0x180
-
-    def __init__(self, path):
+    def __init__(self, allocator, path):
+        self.allocator = allocator
         self.path = path
         self.values = []
 
     def get_handle(self):
-        hkey = RegKey.curr_handle
-        RegKey.curr_handle += 4
-        return hkey
+        return self.allocator.allocate_reg_key_handle()
 
     def get_path(self):
         return self.path
@@ -82,10 +97,9 @@ class RegKey:
         return self.values
 
     def get_value(self, val_name):
-        if not val_name:
-            val_name = "default"
+        names = (val_name.lower(),) if val_name else ("", "default")
         for v in self.values:
-            if val_name.lower() == v.get_name().lower():
+            if v.get_name().lower() in names:
                 return v
 
 
@@ -94,12 +108,12 @@ class RegistryManager:
     Manages the emulation of the windows registry. This includes creating keys, subkeys and values
     """
 
-    def __init__(self, config=None):
+    def __init__(self, allocator, config=None):
         super().__init__()
         self.reg_handles = {}
         self.keys = []
         self.config = config
-        self.reg_tree = []
+        self.allocator = allocator
 
         for hk in (HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS):
             path = regdefs.get_hkey_type(hk)
@@ -126,30 +140,34 @@ class RegistryManager:
                 return key
         return None
 
+    def get_key_paths(self):
+        """
+        Get the paths of the open keys and of the keys in the config
+        """
+        paths = [key.get_path() for key in self.keys]
+        if self.config:
+            paths += [key.path for key in self.config.keys]
+        return paths
+
     def is_key_a_parent_key(self, path):
-        for key in self.keys:
-            if key.get_path().lower().startswith(path.lower()):
-                return True
-        return False
+        prefix = path.lower().rstrip("\\") + "\\"
+        return any(p.lower().startswith(prefix) for p in self.get_key_paths())
 
     def get_subkeys(self, key):
         # TODO: once we revamp the registry emulation,
         # make this better
 
-        parent_path = key.get_path()
-        subkeys = []
-        for k in self.keys:
-            test_path = k.get_path()
+        parent_path = key.get_path().rstrip("\\") + "\\"
+        subkeys: list[str] = []
+        for test_path in self.get_key_paths():
             if test_path.lower().startswith(parent_path.lower()):
                 sub = test_path[len(parent_path) :]
-                if sub.startswith("\\"):
-                    sub = sub[1:]
 
                 end_slash = sub.find("\\")
                 if end_slash >= 0:
                     sub = sub[:end_slash]
 
-                if not sub:
+                if not sub or sub.lower() in (s.lower() for s in subkeys):
                     continue
 
                 subkeys.append(sub)
@@ -164,14 +182,10 @@ class RegistryManager:
             return None
         for key in self.config.keys:
             if key.path.lower() == path.lower():
-                new_key = RegKey(path)
+                new_key = RegKey(self.allocator, path)
                 for value in key.values:
-                    val_type = value.type
-                    vts = regdefs.get_flag_value(val_type)  # noqa
-
                     val_name = value.name or ""
-                    data = value.data
-                    new_key.create_value(val_name, val_type, data)
+                    new_key.create_value(val_name, regdefs.get_flag_value(value.type), value.data)
                 return new_key
         return None
 
@@ -189,9 +203,10 @@ class RegistryManager:
         # Does this key exist in our config
         key = self.get_key_from_config(path)
         if key:
+            self.keys.append(key)
             return key
 
-        key = RegKey(path)
+        key = RegKey(self.allocator, path)
         self.keys.append(key)
         return key
 
@@ -211,13 +226,14 @@ class RegistryManager:
         # Does this key exist in our config
         key = self.get_key_from_config(path)
         if key:
+            self.keys.append(key)
             hnd = key.get_handle()
             self.reg_handles.update({hnd: key})
             return hnd
 
         # If we are instructed to create the key, do so
         if create or self.is_key_a_parent_key(path):
-            key = RegKey(path)
+            key = RegKey(self.allocator, path)
             hnd = key.get_handle()
             self.reg_handles.update({hnd: key})
             self.keys.append(key)

@@ -1,11 +1,12 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 # Data format versioning
-__report_version__ = "3.0.0"
+__report_version__ = "5.0.0"
 
 import hashlib
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 from speakeasy.artifacts import MAX_EMBEDDED_FILE_SIZE, ArtifactStore
@@ -28,6 +29,7 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
     AnyEvent,
+    ApiArg,
     ApiEvent,
     ExceptionEvent,
     FileCreateEvent,
@@ -39,7 +41,6 @@ from speakeasy.profiler_events import (
     MemProtectEvent,
     MemReadEvent,
     MemWriteEvent,
-    ModuleLoadEvent,
     NetDnsEvent,
     NetHttpEvent,
     NetTrafficEvent,
@@ -70,10 +71,6 @@ from speakeasy.report import (
 )
 
 
-class ProfileError(Exception):
-    pass
-
-
 class MemAccess:
     """
     Represents a symbolicated chunk of memory that can be tracked
@@ -88,6 +85,27 @@ class MemAccess:
         self.execs = 0
 
 
+@dataclass
+class GuestCallbackFrame:
+    """State retained while guest callbacks run: the API call that started them, if any."""
+
+    stack_pointer: int
+    return_address: int
+    argc: int = 0
+    convention: int | None = None
+    function: int = 0
+    pending: list[tuple[int, tuple[int, ...]]] = field(default_factory=list)
+    result: int | None = None
+    initializers: dict[int, tuple[Any, bool, bool, int]] = field(default_factory=dict)
+    failure_result: int = 0
+    failure_writes: list[tuple[int, bytes]] = field(default_factory=list)
+    event: ApiEvent | None = None
+    created_modules: list[Any] = field(default_factory=list)
+    loader_attachments: list[tuple[Any, dict[int, Any]]] = field(default_factory=list)
+    # Set while a generator handler (speakeasy.windows.guest_callbacks) runs on this frame
+    handler: Any = None
+
+
 class Run:
     """
     This class represents the basic execution primative for the emulation engine
@@ -97,6 +115,9 @@ class Run:
 
     def __init__(self):
         self.instr_cnt: int = 0
+        self.execution_elapsed: float = 0.0
+        self.budget_instructions: int = 0
+        self.guest_initialization: tuple[Any, bool, bool, int] | None = None
         self.ret_val: int | None = None
         self.events: list[AnyEvent] = []
         self.sym_access: dict[int, MemAccess] = {}
@@ -109,7 +130,7 @@ class Run:
         self.unique_apis: list[str] = []
         self.api_hash = hashlib.sha256()
         self.stack: MemAccess | None = None
-        self.api_callbacks: list[tuple[int, str, list[Any] | tuple[Any, ...]]] = []
+        self.guest_callbacks: list[GuestCallbackFrame] = []
         self.exec_cache: deque[MemAccess] = deque(maxlen=4)
         self.read_cache: deque[MemAccess] = deque(maxlen=4)
         self.write_cache: deque[MemAccess] = deque(maxlen=4)
@@ -175,12 +196,6 @@ class Profiler:
         """
         self.runtime = self.get_run_time()
 
-    def get_epoch_time(self):
-        """
-        Get the current time in epoch format
-        """
-        return int(time.time())
-
     def add_run(self, run: Run) -> None:
         """
         Add a new run to the captured run list
@@ -213,10 +228,7 @@ class Profiler:
 
     def record_dropped_files_event(self, run, files):
         for f in files:
-            data = f.get_data()
-            if data is None:
-                continue
-
+            data = f.get_contents()
             _hash = f.get_hash()
             data_ref = None
             if len(data) <= MAX_EMBEDDED_FILE_SIZE:
@@ -224,9 +236,23 @@ class Profiler:
             entry = {"path": f.path, "size": len(data), "sha256": _hash, "data_ref": data_ref}
             run.dropped_files.append(entry)
 
-    def record_api_event(self, run, pos: TracePosition, name, ret, argv):
+    def record_api_event(
+        self,
+        run: Run,
+        pos: TracePosition,
+        name: str,
+        ret: int | None,
+        args: list[ApiArg],
+        *,
+        deduplicate: bool = True,
+    ) -> ApiEvent:
         """
-        Log a call to an OS API. This includes arguments, return address, and return value
+        Log a call to an OS API. This includes arguments, return address, and return value.
+
+        A call is recorded once when it repeats the API, address, arguments and
+        return value of one of the last few events. Raw argument values do not
+        count, so a loop that passes the same string from another buffer stays
+        one event.
         """
         run.num_apis += 1
 
@@ -235,28 +261,19 @@ class Profiler:
             run.unique_apis.append(name)
 
         ret_str = hex(ret) if ret is not None else None
+        event = ApiEvent(pos=pos, api_name=name, args=args, ret_val=ret_str)
 
-        args = argv.copy()
-        for i, arg in enumerate(args):
-            if isinstance(arg, int):
-                args[i] = hex(arg)
-
-        event = ApiEvent(
-            pos=pos,
-            api_name=name,
-            args=args,
-            ret_val=ret_str,
-        )
-
+        shown = [(a.name, a.type, a.display) for a in args]
         recent_events = [e for e in run.events[-3:] if isinstance(e, ApiEvent)]
-        if not any(
+        if not deduplicate or not any(
             e.pos.pc == event.pos.pc
             and e.api_name == event.api_name
-            and e.args == event.args
+            and [(a.name, a.type, a.display) for a in e.args] == shown
             and e.ret_val == event.ret_val
             for e in recent_events
         ):
             run.events.append(event)
+        return event
 
     def record_file_access_event(
         self,
@@ -420,43 +437,52 @@ class Profiler:
         Log events related to a process accessing another process. This includes:
         creating a child process, reading/writing to a process, or creating a thread
         within another process.
+
+        ``pos`` is the actor's execution position (the process/thread that performed
+        the operation); ``proc`` is the target. The target process id is carried as
+        event payload (``pid``) so the event stays in the actor's timeline. When the
+        target is the actor's own process, the payload ``pid`` is left NULL, so a
+        populated ``pid`` always means the operation crossed a process boundary.
         """
-        pid = proc.id
+        pid = None if proc.id == pos.pid else proc.id
         path = proc.path
-        proc_pos = TracePosition(tick=pos.tick, tid=pos.tid, pid=pid, pc=pos.pc)
 
         event: AnyEvent
         if event_type == PROC_CREATE:
             event = ProcessCreateEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 cmdline=proc.cmdline,
+                pid=pid,
             )
 
         elif event_type == MEM_ALLOC:
             event = MemAllocEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 base=hex(kwargs.get("base", 0)),
                 size=hex(kwargs.get("size", 0)),
                 protect=kwargs.get("protect"),
+                pid=pid,
             )
 
         elif event_type == MEM_PROTECT:
             event = MemProtectEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 base=hex(kwargs.get("base", 0)),
                 size=hex(kwargs.get("size", 0)),
                 protect=kwargs.get("protect"),
+                pid=pid,
             )
 
         elif event_type == MEM_FREE:
             event = MemFreeEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 base=hex(kwargs.get("base", 0)),
                 size=hex(kwargs.get("size", 0)),
+                pid=pid,
             )
 
         elif event_type == MEM_WRITE:
@@ -471,11 +497,12 @@ class Profiler:
                 self.last_data = [base, size]
                 return
             event = MemWriteEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 base=hex(base),
                 size=size,
                 data_ref=self.put_binary_data(data, limit=1024),
+                pid=pid,
             )
             self.last_data = [base, size]
 
@@ -491,28 +518,33 @@ class Profiler:
                 self.last_data = [base, size]
                 return
             event = MemReadEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 base=hex(base),
                 size=size,
                 data_ref=self.put_binary_data(data, limit=1024),
+                pid=pid,
             )
             self.last_data = [base, size]
 
         elif event_type == THREAD_INJECT:
             event = ThreadInjectEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 start_addr=hex(kwargs["start_addr"]),
                 param=hex(kwargs["param"]),
+                pid=pid,
+                tid=kwargs.get("tid"),
             )
 
         elif event_type == THREAD_CREATE:
             event = ThreadCreateEvent(
-                pos=proc_pos,
+                pos=pos,
                 path=path,
                 start_addr=hex(kwargs["start_addr"]),
                 param=hex(kwargs["param"]),
+                pid=pid,
+                tid=kwargs.get("tid"),
             )
 
         else:
@@ -616,19 +648,6 @@ class Profiler:
             faulting_address=faulting_address,
             pc_module=pc_module,
             stack_trace=stack_trace,
-        )
-        run.events.append(event)
-
-    def record_module_load_event(self, run, pos: TracePosition, name, path, base, size):
-        """
-        Log module (PE/DLL) load events
-        """
-        event = ModuleLoadEvent(
-            pos=pos,
-            name=name,
-            path=path,
-            base=hex(base),
-            size=hex(size),
         )
         run.events.append(event)
 

@@ -5,11 +5,14 @@ This page covers runtime limits, execution mode, and debugging controls.
 ## Stopping conditions
 
 Primary flags:
-- `--timeout`: wall-clock timeout in seconds
+- `--timeout`: active execution timeout in seconds per run
+- `--max-total-time`: active execution cap in seconds across all runs (0, the default, disables it)
 - `--max-api-count`: cap API calls per run
 - `--max-instructions`: cap executed instructions per run
 
 Use these together to bound long-running or looping samples.
+
+The CLI emulates in a child process. It stops that process after the larger of `--timeout` and `--max-total-time` and saves the report that the process gives within 5 seconds of the stop.
 
 ## Execution mode controls
 
@@ -34,6 +37,7 @@ speakeasy -t shellcode.bin \
 Primary flags:
 - `--verbose`: DEBUG logging
 - `--gdb`: start GDB stub and pause before first instruction
+- `--gdb-host`: GDB stub bind host (default `127.0.0.1`)
 - `--gdb-port`: GDB stub port
 
 Notes:

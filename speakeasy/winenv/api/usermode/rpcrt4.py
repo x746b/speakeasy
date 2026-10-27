@@ -21,7 +21,7 @@ class RPCRT4(api.ApiHandler):
         super().__init__(emu)
 
     @apihook("UuidCreate", argc=1)
-    def UuidCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def UuidCreate(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         RPC_STATUS UuidCreate(
           UUID *Uuid
@@ -43,7 +43,7 @@ class RPCRT4(api.ApiHandler):
         return 0
 
     @apihook("UuidToStringA", argc=2)
-    def UuidToStringA(self, emu, argv, ctx: api.ApiContext = None):
+    def UuidToStringA(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         RPC_STATUS UuidToStringA(
           const UUID *Uuid,
@@ -56,10 +56,12 @@ class RPCRT4(api.ApiHandler):
             return 1
 
         uuid_bytes = self.mem_read(uuidp, windefs.GUID().sizeof())
-        uuid_obj = uuid.UUID(bytes=uuid_bytes)
+        uuid_obj = uuid.UUID(bytes_le=uuid_bytes)
 
-        string = str(uuid_obj)
+        string = str(uuid_obj) + "\0"
 
-        self.mem_write(stringp, string.encode("utf-8"))
+        buf = self.mem_alloc(len(string), tag="api.UuidToStringA")
+        self.mem_write(buf, string.encode("utf-8"))
+        self.mem_write(stringp, buf.to_bytes(self.get_ptr_size(), "little"))
 
         return 0

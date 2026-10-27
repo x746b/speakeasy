@@ -21,6 +21,7 @@ This page maps common tasks to the right Speakeasy documentation.
 - [Configuration walkthrough](configuration.md)
 - [Report walkthrough](reporting.md)
 - [Memory management](memory.md)
+- [Exception dispatch](exceptions.md)
 - [Limitations](limitations.md)
 
 ## Debugging
@@ -33,6 +34,7 @@ This page maps common tasks to the right Speakeasy documentation.
 - [Python library usage](library.md)
 - [Mounting host files with --volume](volumes.md)
 - [Adding API handlers](api-handlers.md)
+- [Unified Windows API addresses](unified-api-addresses.md)
 - [Examples directory](../examples/)
 - [Speakeasy 2 walkthrough outline](speakeasy2-walkthrough.md)
 

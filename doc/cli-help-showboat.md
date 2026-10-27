@@ -13,7 +13,8 @@ Captured from the current source tree to show the full runtime and schema-derive
 usage: cli.py [-h] [-t TARGET] [-o OUTPUT] [--argv ARGV] [-c CONFIG]
               [--dump-default-config] [--raw] [--raw-offset RAW_OFFSET]
               [--arch ARCH] [--dropped-files-path DROPPED_FILES_PATH] [-k] [--no-mp] [-v]
-              [--gdb] [--gdb-port GDB_PORT] [-V VOLUMES] [--timeout TIMEOUT]
+              [--gdb] [--gdb-host GDB_HOST] [--gdb-port GDB_PORT]
+              [-V VOLUMES] [--timeout TIMEOUT]
               [--max-api-count MAX_API_COUNT]
               [--max-instructions MAX_INSTRUCTIONS]
               [--analysis-memory-tracing | --no-analysis-memory-tracing]
@@ -66,6 +67,7 @@ options:
   -v, --verbose         Enable verbose (DEBUG) logging
   --gdb                 Enable GDB server stub (pauses before first
                         instruction)
+  --gdb-host GDB_HOST   GDB server bind host (default: 127.0.0.1)
   --gdb-port GDB_PORT   GDB server port (default: 1234)
   -V, --volume VOLUMES  Mount a host path into the emulated filesystem
                         (host_path:guest_path). May be repeated.
@@ -134,11 +136,11 @@ options:
                         Treat unresolved imports as existing stubs. (default:
                         False)
   --modules-module-directory-x86 MODULE_DIRECTORY_X86
-                        Search path for x86 decoy modules. (default:
-                        '$ROOT$/winenv/decoys/x86')
+                        Directory of x86 DLLs to load instead of synthetic API
+                        modules. (default: None)
   --modules-module-directory-x64 MODULE_DIRECTORY_X64
-                        Search path for x64 decoy modules. (default:
-                        '$ROOT$/winenv/decoys/amd64')
+                        Directory of x64 DLLs to load instead of synthetic API
+                        modules. (default: None)
 ```
 
 ## Related docs

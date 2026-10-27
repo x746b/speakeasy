@@ -14,7 +14,6 @@ class Urlmon(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
         self.funcs = {}
         self.data = {}
@@ -23,7 +22,7 @@ class Urlmon(api.ApiHandler):
         self.names = {}
 
     @apihook("URLDownloadToFile", argc=5)
-    def URLDownloadToFile(self, emu, argv, ctx: api.ApiContext = None):
+    def URLDownloadToFile(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT URLDownloadToFile(
                     LPUNKNOWN            pCaller,
@@ -33,8 +32,6 @@ class Urlmon(api.ApiHandler):
                     LPBINDSTATUSCALLBACK lpfnCB
         );
         """
-        ctx = ctx or {}
-
         pCaller, szURL, szFileName, dwReserved, lpfnCB = argv
         rv = windefs.ERROR_SUCCESS
 
@@ -42,21 +39,21 @@ class Urlmon(api.ApiHandler):
 
         if szURL:
             url = self.read_mem_string(szURL, cw)
-            argv[1] = url
+            ctx.args["szURL"].display = url
             parsed = urlparse(url)
             if parsed.netloc:
                 self.record_dns_event(parsed.netloc)
 
         if szFileName:
             name = self.read_mem_string(szFileName, cw)
-            argv[2] = name
+            ctx.args["szFileName"].display = name
             self.record_file_access_event(name, FILE_CREATE)
             self.record_file_access_event(name, FILE_WRITE)
 
         return rv
 
     @apihook("URLDownloadToCacheFile", argc=6)
-    def URLDownloadToCacheFile(self, emu, argv, ctx: api.ApiContext = None):
+    def URLDownloadToCacheFile(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT URLDownloadToCacheFileA(
           LPUNKNOWN            pCaller,
@@ -67,7 +64,6 @@ class Urlmon(api.ApiHandler):
           LPBINDSTATUSCALLBACK lpfnCB
         );
         """
-        ctx = ctx or {}
         pCaller, szURL, szFileName, cchFileName, dwReserved, lpfnCB = argv
         rv = windefs.ERROR_SUCCESS
         cw = self.get_char_width(ctx)
@@ -76,7 +72,7 @@ class Urlmon(api.ApiHandler):
 
         if szURL:
             url = self.read_mem_string(szURL, cw)
-            argv[1] = url
+            ctx.args["szURL"].display = url
             parsed = urlparse(url)
             if parsed.netloc:
                 self.record_dns_event(parsed.netloc)
@@ -86,13 +82,12 @@ class Urlmon(api.ApiHandler):
 
         if szFileName:
             required = len(cache_name) + 1
-            argv[2] = cache_name
-            argv[3] = cchFileName
+            ctx.args["szFileName"].display = cache_name
             if cchFileName >= required:
                 self.write_mem_string(cache_name, szFileName, cw)
                 self.record_file_access_event(cache_name, FILE_CREATE)
                 self.record_file_access_event(cache_name, FILE_WRITE)
             else:
-                rv = windefs.ERROR_INSUFFICIENT_BUFFER
+                rv = windefs.E_OUTOFMEMORY
 
         return rv

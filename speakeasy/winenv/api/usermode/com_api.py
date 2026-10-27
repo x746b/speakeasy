@@ -15,7 +15,6 @@ class ComApi(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -25,18 +24,29 @@ class ComApi(api.ApiHandler):
 
     # First argument (self) is not reflected in method definitions; note this increases argc by 1
     @apihook("IUnknown.QueryInterface", argc=3)
-    def IUnknown_QueryInterface(self, emu, argv, ctx: api.ApiContext = None):
+    def IUnknown_QueryInterface(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT QueryInterface(
             REFIID riid,
             void   **ppvObject
         );
         """
-        # not implemented
-        return comdefs.S_OK
+        ptr, riid, ppvObject = argv
+        if not ppvObject:
+            return comdefs.E_POINTER
+
+        iid = comdefs.convert_guid_bytes_to_str(self.mem_read(riid, 16))
+        iid_name = comdefs.get_iid(iid)
+        if iid_name:
+            ctx.args[1].display = iid_name
+            self.mem_write(ppvObject, ptr.to_bytes(emu.get_ptr_size(), "little"))
+            return comdefs.S_OK
+
+        self.mem_write(ppvObject, b"\x00" * emu.get_ptr_size())
+        return comdefs.E_NOINTERFACE
 
     @apihook("IUnknown.AddRef", argc=1)
-    def IUnknown_AddRef(self, emu, argv, ctx: api.ApiContext = None):
+    def IUnknown_AddRef(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ULONG AddRef();
         """
@@ -44,7 +54,7 @@ class ComApi(api.ApiHandler):
         return 1
 
     @apihook("IUnknown.Release", argc=1)
-    def IUnknown_Release(self, emu, argv, ctx: api.ApiContext = None):
+    def IUnknown_Release(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ULONG Release();
         """
@@ -52,7 +62,7 @@ class ComApi(api.ApiHandler):
         return 0
 
     @apihook("IWbemLocator.ConnectServer", argc=9)
-    def IWbemLocator_ConnectServer(self, emu, argv, ctx: api.ApiContext = None):
+    def IWbemLocator_ConnectServer(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT ConnectServer(
             const BSTR    strNetworkResource,
@@ -66,7 +76,7 @@ class ComApi(api.ApiHandler):
         );
         """
         ptr, strNetworkResource, strUser, strPassword, strLocale, lSecurityFlags, strAuthority, pCtx, ppNamespace = argv
-        argv[1] = self.read_wide_string(strNetworkResource)
+        ctx.args[1].display = self.read_wide_string(strNetworkResource)
 
         if ppNamespace:
             ci = emu.com.get_interface(emu, emu.get_ptr_size(), "IWbemServices")
@@ -77,7 +87,7 @@ class ComApi(api.ApiHandler):
         return comdefs.S_OK
 
     @apihook("IWbemServices.ExecQuery", argc=6)
-    def IWbemServices_ExecQuery(self, emu, argv, ctx: api.ApiContext = None):
+    def IWbemServices_ExecQuery(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT ExecQuery(
             const BSTR           strQueryLanguage,
@@ -88,8 +98,8 @@ class ComApi(api.ApiHandler):
         );
         """
         ptr, strQueryLanguage, strQuery, lFlags, pCtx, ppEnum = argv
-        argv[1] = self.read_wide_string(strQueryLanguage)
-        argv[2] = self.read_wide_string(strQuery)
+        ctx.args[1].display = self.read_wide_string(strQueryLanguage)
+        ctx.args[2].display = self.read_wide_string(strQuery)
 
         # not implemented so returning -1
         return -1

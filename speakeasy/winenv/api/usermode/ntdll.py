@@ -1,16 +1,18 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import binascii
-import os
+import struct
 
 import speakeasy.windows.common as winemu
+import speakeasy.windows.seh as seh
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
 
 from .. import api
+from ..exception_apis import ExceptionApis
 
 
-class Ntdll(api.ApiHandler):
+class Ntdll(ExceptionApis, api.ApiHandler):
     """
     Implements exported native functions from ntdll.dll. If a function is not supported
     here, but is supported in the ntoskrnl handler (e.g. NtCreateFile) it will be handled by
@@ -22,7 +24,6 @@ class Ntdll(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -31,23 +32,23 @@ class Ntdll(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("RtlGetLastWin32Error", argc=0)
-    def RtlGetLastWin32Error(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlGetLastWin32Error(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """DWORD RtlGetLastWin32Error();"""
 
         return emu.get_last_error()
 
     @apihook("RtlNtStatusToDosError", argc=1)
-    def RtlNtStatusToDosError(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlNtStatusToDosError(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """ULONG RtlNtStatusToDosError(NTSTATUS Status);"""
         return 0
 
     @apihook("RtlFlushSecureMemoryCache", argc=2)
-    def RtlFlushSecureMemoryCache(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlFlushSecureMemoryCache(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """DWORD RtlFlushSecureMemoryCache(PVOID arg0, PVOID arg1);"""
         return True
 
     @apihook("RtlAddVectoredExceptionHandler", argc=2)
-    def RtlAddVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlAddVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID AddVectoredExceptionHandler(
             ULONG                       First,
@@ -60,15 +61,26 @@ class Ntdll(api.ApiHandler):
 
         return Handler
 
+    @apihook("RtlRaiseException", argc=1)
+    def RtlRaiseException(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """VOID RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);"""
+        if emu.config.exceptions.dispatch_handlers:
+            return emu.exception_dispatcher().rtl_raise_exception(emu, argv[0])
+
+    @apihook("NtContinue", argc=2)
+    def NtContinue(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """NTSTATUS NtContinue(PCONTEXT ContextRecord, BOOLEAN TestAlert);"""
+        return seh.restore_context(emu, argv[0])
+
     @apihook("NtYieldExecution", argc=0)
-    def NtYieldExecution(self, emu, argv, ctx: api.ApiContext = None):
+    def NtYieldExecution(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NtYieldExecution();
         """
         return 0
 
     @apihook("RtlRemoveVectoredExceptionHandler", argc=1)
-    def RtlRemoveVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlRemoveVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ULONG RemoveVectoredExceptionHandler(
             PVOID Handle
@@ -81,7 +93,7 @@ class Ntdll(api.ApiHandler):
         return Handler
 
     @apihook("LdrLoadDll", argc=4)
-    def LdrLoadDll(self, emu, argv, ctx: api.ApiContext = None):
+    def LdrLoadDll(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """NTSTATUS
         NTAPI
         LdrLoadDll(
@@ -117,10 +129,10 @@ class Ntdll(api.ApiHandler):
         pretty_flags = " | ".join([name for bit, name in flags.items() if LoadFlags & bit])
 
         if SearchPath:
-            argv[0] = self.read_mem_string(SearchPath, 2)
+            ctx.args["DllPath"].display = self.read_mem_string(SearchPath, 2)
 
-        argv[2] = req_lib
-        argv[1] = pretty_flags
+        ctx.args["DllName"].display = req_lib
+        ctx.args["DllCharacteristics"].display = pretty_flags
 
         if not hmod:
             STATUS_DLL_NOT_FOUND = 0xC0000135
@@ -128,11 +140,16 @@ class Ntdll(api.ApiHandler):
 
         if BaseAddress:
             self.mem_write(BaseAddress, hmod.to_bytes(self.get_ptr_size(), "little"))
+        frame = emu.active_api_frame
+        if frame is not None and frame.initializers:
+            frame.failure_result = 0xC0000142  # STATUS_DLL_INIT_FAILED
+            if BaseAddress:
+                frame.failure_writes.append((BaseAddress, b"\x00" * self.get_ptr_size()))
 
         return 0
 
     @apihook("LdrGetProcedureAddress", argc=4)
-    def LdrGetProcedureAddress(self, emu, argv, ctx: api.ApiContext = None):
+    def LdrGetProcedureAddress(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS LdrGetProcedureAddress(
             HMODULE ModuleHandle,
@@ -150,24 +167,26 @@ class Ntdll(api.ApiHandler):
             fn = self.mem_cast(fn, proc_name)
 
             proc = self.read_mem_string(fn.Buffer, 1, max_chars=fn.Length)
-            argv[1] = proc
+            ctx.args["ProcedureName"].display = proc
 
         elif ordinal:
-            proc = f"ordinal_{proc_name}"
+            proc = f"ordinal_{ordinal}"
+        else:
+            return ddk.STATUS_INVALID_PARAMETER
 
         mods = emu.get_peb_modules()
         for mod in mods:
             if mod.base == hmod:
-                bn = mod.get_base_name()
-                mname, _ = os.path.splitext(bn)
-                addr = emu.get_proc(mname, proc)
-                rv = ddk.STATUS_SUCCESS
-                self.mem_write(func_addr, addr.to_bytes(self.get_ptr_size(), "little"))
+                addr = emu.resolve_export(mod, proc)
+                if addr:
+                    rv = ddk.STATUS_SUCCESS
+                    self.mem_write(func_addr, addr.to_bytes(self.get_ptr_size(), "little"))
+                break
 
         return rv
 
     @apihook("RtlZeroMemory", argc=2)
-    def RtlZeroMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlZeroMemory(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void RtlZeroMemory(
             void*  Destination,
@@ -179,7 +198,7 @@ class Ntdll(api.ApiHandler):
         self.mem_write(dest, buf)
 
     @apihook("RtlMoveMemory", argc=3)
-    def RtlMoveMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlMoveMemory(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void RtlMoveMemory(void* pvDest, const void *pSrc, size_t Length);
         """
@@ -188,7 +207,7 @@ class Ntdll(api.ApiHandler):
         self.mem_write(dest, buf)
 
     @apihook("NtSetInformationProcess", argc=4)
-    def NtSetInformationProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def NtSetInformationProcess(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS
         NTAPI
@@ -202,7 +221,7 @@ class Ntdll(api.ApiHandler):
         return 0
 
     @apihook("RtlEncodePointer", argc=1)
-    def RtlEncodePointer(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlEncodePointer(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID
         NTAPI
@@ -215,7 +234,7 @@ class Ntdll(api.ApiHandler):
         return rv
 
     @apihook("RtlDecodePointer", argc=1)
-    def RtlDecodePointer(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlDecodePointer(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID
         NTAPI
@@ -228,7 +247,7 @@ class Ntdll(api.ApiHandler):
         return rv
 
     @apihook("NtWaitForSingleObject", argc=3)
-    def NtWaitForSingleObject(self, emu, argv, ctx: api.ApiContext = None):
+    def NtWaitForSingleObject(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSYSAPI
         NTSTATUS
@@ -251,7 +270,7 @@ class Ntdll(api.ApiHandler):
         return rv
 
     @apihook("RtlComputeCrc32", argc=3)
-    def RtlComputeCrc32(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlComputeCrc32(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD RtlComputeCrc32(
             DWORD       dwInitial,
@@ -262,12 +281,12 @@ class Ntdll(api.ApiHandler):
         dwInitial, pData, iLen = argv
 
         data_to_compute = self.mem_read(pData, iLen)
-        dwInitial = binascii.crc32(data_to_compute)
+        dwInitial = binascii.crc32(data_to_compute, dwInitial)
 
         return dwInitial
 
     @apihook("LdrFindResource_U", argc=4)
-    def LdrFindResource_U(self, emu, argv, ctx: api.ApiContext = None):
+    def LdrFindResource_U(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         pub unsafe extern "system" fn LdrFindResource_U(
             DllHandle: PVOID,
@@ -327,18 +346,8 @@ class Ntdll(api.ApiHandler):
 
         return ddk.STATUS_SUCCESS
 
-    @apihook("NtUnmapViewOfSection", argc=2)
-    def NtUnmapViewOfSection(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        NTSTATUS NtUnmapViewOfSection(
-            HANDLE ProcessHandle,
-            PVOID  BaseAddress
-        );
-        """
-        return ddk.STATUS_SUCCESS
-
     @apihook("LdrAccessResource", argc=4)
-    def LdrAccessResource(self, emu, argv, ctx: api.ApiContext = None):
+    def LdrAccessResource(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS NTAPI LdrAccessResource    (   _In_ PVOID      BaseAddress,
                 _In_ PIMAGE_RESOURCE_DATA_ENTRY     ResourceDataEntry,
@@ -351,11 +360,10 @@ class Ntdll(api.ApiHandler):
         if ResourceDataEntry == 0:
             return ddk.STATUS_INVALID_PARAMETER
 
-        offset = emu.read_mem_value(ResourceDataEntry, 4)
-        size = emu.read_mem_value(ResourceDataEntry + 4, 4)
+        offset, size = struct.unpack("<II", self.mem_read(ResourceDataEntry, 8))
 
         if Size:
-            emu.write_ptr(Size, size)
+            self.mem_write(Size, size.to_bytes(4, "little"))
 
         if Resource:
             emu.write_ptr(Resource, BaseAddress + offset)
@@ -363,7 +371,7 @@ class Ntdll(api.ApiHandler):
         return ddk.STATUS_SUCCESS
 
     @apihook("RtlGetNtVersionNumbers", argc=3)
-    def RtlGetNtVersionNumbers(self, emu, argv, ctx={}):
+    def RtlGetNtVersionNumbers(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void RtlGetNtVersionNumbers(
             DWORD *pNtMajorVersion,
@@ -380,7 +388,7 @@ class Ntdll(api.ApiHandler):
             self.mem_write(pBuild, (0xF0004A61).to_bytes(4, "little"))
 
     @apihook("RtlGetCurrentPeb", argc=0)
-    def RtlGetCurrentPeb(self, emu, argv, ctx={}):
+    def RtlGetCurrentPeb(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PPEB RtlGetCurrentPeb();
         """
@@ -390,15 +398,13 @@ class Ntdll(api.ApiHandler):
         return 0
 
     @apihook("RtlGetVersion", argc=1)
-    def RtlGetVersion(self, emu, argv, ctx={}):
+    def RtlGetVersion(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS RtlGetVersion(PRTL_OSVERSIONINFOW lpVersionInformation);
         """
         (lpVersionInformation,) = argv
         # RTL_OSVERSIONINFOW: dwOSVersionInfoSize(4), dwMajorVersion(4),
         # dwMinorVersion(4), dwBuildNumber(4), dwPlatformId(4), szCSDVersion(256)
-        import struct
-
         info = struct.pack("<IIIII", 276, 10, 0, 19041, 2)  # VER_PLATFORM_WIN32_NT=2
         info += b"\x00" * (276 - len(info))
         self.mem_write(lpVersionInformation, info)

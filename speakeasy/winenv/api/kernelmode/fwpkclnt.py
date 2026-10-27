@@ -14,10 +14,6 @@ FWP_E_LAYER_NOT_FOUND = 0x80320004
 FWP_E_SUBLAYER_NOT_FOUND = 0x80320007
 
 
-class NetIoEmuError(Exception):
-    pass
-
-
 class Fwpkclnt(api.ApiHandler):
     """
     Fwpkclnt is the Windows driver that implements the Windows Filtering Platform.
@@ -29,7 +25,6 @@ class Fwpkclnt(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -53,7 +48,6 @@ class Fwpkclnt(api.ApiHandler):
         return tmp
 
     def new_session(self):
-
         # stub
         ret = self.new_id()
         self.sessions.update({ret: "sess"})
@@ -73,7 +67,7 @@ class Fwpkclnt(api.ApiHandler):
         return ret
 
     @apihook("FwpmEngineOpen0", argc=5)
-    def FwpmEngineOpen0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmEngineOpen0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmEngineOpen0(
         const wchar_t             *serverName,
@@ -95,7 +89,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpsInjectionHandleCreate0", argc=3)
-    def FwpsInjectionHandleCreate0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsInjectionHandleCreate0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS FwpsInjectionHandleCreate0(
         ADDRESS_FAMILY addressFamily,
@@ -114,7 +108,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpmSubLayerAdd0", argc=3)
-    def FwpmSubLayerAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmSubLayerAdd0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmSubLayerAdd0(
         HANDLE               engineHandle,
@@ -156,7 +150,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpsCalloutRegister1", argc=3)
-    def FwpsCalloutRegister1(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsCalloutRegister1(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS FwpsCalloutRegister1(
           void                *deviceObject,
@@ -199,7 +193,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpmCalloutAdd0", argc=4)
-    def FwpmCalloutAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmCalloutAdd0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmCalloutAdd0(
           HANDLE               engineHandle,
@@ -240,7 +234,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpmFilterAdd0", argc=4)
-    def FwpmFilterAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmFilterAdd0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmFilterAdd0(
           HANDLE               engineHandle,
@@ -250,8 +244,6 @@ class Fwpkclnt(api.ApiHandler):
         );
         """
         eng, pFilter, sd, pId = argv
-
-        self.mem_write(pId, b"\x41\x41")
 
         rv = ddk.STATUS_SUCCESS
 
@@ -275,26 +267,32 @@ class Fwpkclnt(api.ApiHandler):
         flt_key = str(flt_key)
 
         fid = self.new_filter(name, desc, flt_key)
-        self.mem_write(pId, fid.to_bytes(8, "little"))
+        if pId:
+            self.mem_write(pId, fid.to_bytes(8, "little"))
 
         return rv
 
-    @apihook("FwpmFilterDeleteById0", argc=2)
-    def FwpmFilterDeleteById0(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("FwpmFilterDeleteById0", argc=3)
+    def FwpmFilterDeleteById0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmFilterDeleteById0(
         HANDLE engineHandle,
         UINT64 id
         );
+
+        id is passed by value: two stack slots on x86, one register on x64.
         """
-        eng, fid = argv
+        if emu.get_ptr_size() == 4:
+            eng, fid = argv[0], (argv[2] << 32) | argv[1]
+        else:
+            eng, fid = argv[:2]
 
         rv = ddk.STATUS_SUCCESS
 
         return rv
 
     @apihook("FwpmCalloutDeleteById0", argc=2)
-    def FwpmCalloutDeleteById0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmCalloutDeleteById0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmCalloutDeleteById0(
         HANDLE engineHandle,
@@ -310,7 +308,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpsCalloutUnregisterById0", argc=1)
-    def FwpsCalloutUnregisterById0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsCalloutUnregisterById0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS FwpsCalloutUnregisterById0(
         const UINT32 calloutId
@@ -325,7 +323,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpmSubLayerDeleteByKey0", argc=2)
-    def FwpmSubLayerDeleteByKey0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmSubLayerDeleteByKey0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmSubLayerDeleteByKey0(
         HANDLE     engineHandle,
@@ -339,13 +337,13 @@ class Fwpkclnt(api.ApiHandler):
         guid = self.mem_read(key, 16)
         guid = uuid.UUID(bytes_le=guid)
 
-        if self.sublayers.get(guid):
+        if self.sublayers.pop(str(guid), None):
             rv = ddk.STATUS_SUCCESS
 
         return rv
 
     @apihook("FwpmEngineClose0", argc=1)
-    def FwpmEngineClose0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmEngineClose0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmEngineClose0(
         HANDLE engineHandle
@@ -357,7 +355,7 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpsInjectionHandleDestroy0", argc=1)
-    def FwpsInjectionHandleDestroy0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsInjectionHandleDestroy0(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS FwpsInjectionHandleDestroy0(
         HANDLE injectionHandle

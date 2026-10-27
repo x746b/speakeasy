@@ -27,6 +27,10 @@ WM_PAINT = 0x0F
 
 WM_INITDIALOG = 0x0110
 
+RIM_TYPEMOUSE = 0
+RIM_TYPEKEYBOARD = 1
+RIM_TYPEHID = 2
+
 
 class MSG(EmuStruct):
     def __init__(self, ptr_size):
@@ -36,9 +40,8 @@ class MSG(EmuStruct):
         self.wParam = Ptr
         self.lParam = Ptr
         self.time = ct.c_uint32
-        self.pt_x = Ptr
-        self.pt_y = Ptr
-        self.lPrivate = ct.c_uint32
+        self.pt_x = ct.c_int32
+        self.pt_y = ct.c_int32
 
 
 class KBDLLHOOKSTRUCT(EmuStruct):
@@ -57,6 +60,21 @@ class USEROBJECTFLAGS(EmuStruct):
         self.fInherit = ct.c_uint32
         self.fReserved = ct.c_uint32
         self.dwFlags = ct.c_uint32
+
+
+class WNDCLASS(EmuStruct):
+    def __init__(self, ptr_size):
+        super().__init__(ptr_size)
+        self.style = ct.c_uint32
+        self.lpfnWndProc = Ptr
+        self.cbClsExtra = ct.c_uint32
+        self.cbWndExtra = ct.c_uint32
+        self.hInstance = Ptr
+        self.hIcon = Ptr
+        self.hCursor = Ptr
+        self.hbrBackground = Ptr
+        self.lpszMenuName = Ptr
+        self.lpszClassName = Ptr
 
 
 class WNDCLASSEX(EmuStruct):

@@ -5,22 +5,25 @@ import ntpath
 import os
 import shlex
 
+from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT
+
 import speakeasy.common as common
 import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
 from speakeasy.errors import Win32EmuError
 from speakeasy.profiler import Run
 from speakeasy.windows.com import COM
+from speakeasy.windows.common import _PeParser
 from speakeasy.windows.loaders import (
     PeLoader,
     RuntimeModule,
+    ShellcodeLoader,
     get_prot_string,
 )
 from speakeasy.windows.sessman import SessionManager
 from speakeasy.windows.winemu import WindowsEmulator
 from speakeasy.winenv.api.winapi import WindowsApi
 
-DLL_PROCESS_DETACH = 0
 DLL_PROCESS_ATTACH = 1
 
 MAX_EXPORTS_TO_EMULATE = 10
@@ -31,14 +34,15 @@ class Win32Emulator(WindowsEmulator):
     User Mode Windows Emulator Class
     """
 
-    def __init__(self, config, argv=None, debug=False, exit_event=None, gdb_port=None):
-        super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port)
+    def __init__(self, config, argv=None, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
+        super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port, gdb_host=gdb_host)
 
         self.last_error = 0
         self.peb_addr = 0
         self.heap_allocs = []
+        self.container_image = None
         self.argv = argv if argv is not None else []
-        self.sessman = SessionManager(config)
+        self.sessman = SessionManager(config, self.handle_allocator)
         self.com = COM(config)
 
     def get_argv(self):
@@ -122,7 +126,11 @@ class Win32Emulator(WindowsEmulator):
         """
         Add a vectored exception handler that will be executed on an exception
         """
-        if handler not in self.veh_handlers:
+        if handler in self.veh_handlers:
+            return
+        if first:
+            self.veh_handlers.insert(0, handler)
+        else:
             self.veh_handlers.append(handler)
 
     def remove_vectored_exception_handler(self, handler):
@@ -178,7 +186,7 @@ class Win32Emulator(WindowsEmulator):
         image.emu_path = emu_path
 
         rtmod = self.load_image(image)
-        self.set_func_args(self.stack_base, self.return_hook)
+        self.set_func_args(self.get_stack_ptr(), self.return_hook, conv=_arch.CALL_CONV_STDCALL)
 
         if self.input is not None:
             self.input["image_base"] = rtmod.base
@@ -194,8 +202,6 @@ class Win32Emulator(WindowsEmulator):
     def _set_input_metadata(self, path, data):
         if not self.profiler:
             return
-        from speakeasy.windows.common import _PeParser
-
         pe = _PeParser(path=path, data=data, fast_load=True)
         pe_type = "unknown"
         if pe.is_driver():
@@ -225,6 +231,7 @@ class Win32Emulator(WindowsEmulator):
             self.stop()
             raise Win32EmuError("Module not found")
 
+        startup = []
         # Check if any TLS callbacks exist, these run before the module's entry point
         tls = module.get_tls_callbacks()
         for i, cb_addr in enumerate(tls):
@@ -235,6 +242,7 @@ class Win32Emulator(WindowsEmulator):
                 run.type = f"tls_callback_{i}"
                 run.args = [base, DLL_PROCESS_ATTACH, 0]
                 self.add_run(run)
+                startup.append(run)
 
         if entry_point is not None:
             ep = module.base + entry_point
@@ -255,7 +263,9 @@ class Win32Emulator(WindowsEmulator):
             run.type = "module_entry"
             run.args = [self.mem_map(8, tag=f"emu.module_arg_{i}") for i in range(4)]
 
-        self.add_run(run)
+        if entry_point is not None or module.is_exe() or ep != module.base:
+            self.add_run(run)
+            startup.append(run)
 
         if all_entrypoints:
             # Only emulate a subset of all the exported functions
@@ -266,7 +276,11 @@ class Win32Emulator(WindowsEmulator):
             if exports:
                 args = [self.mem_map(8, tag="emu.export_arg_%d" % (i), base=0x41420000) for i in range(4)]  # noqa
                 for exp in exports:
-                    if exp.name in ("DllMain",):
+                    if (
+                        exp.name in ("DllMain",)
+                        or getattr(exp, "kind", "function") == "data"
+                        or getattr(exp, "forwarder", None)
+                    ):
                         continue
                     run = Run()
                     if exp.name:
@@ -288,7 +302,7 @@ class Win32Emulator(WindowsEmulator):
                     # be called yet
                     self.add_run(run)
 
-        return
+        return startup
 
     def run_module(self, module, all_entrypoints=False, emulate_children=False, entry_point=None):
         """
@@ -297,7 +311,7 @@ class Win32Emulator(WindowsEmulator):
         Arguments:
             module: Module to emulate
         """
-        self.prepare_module_for_emulation(module, all_entrypoints, entry_point=entry_point)
+        startup = self.prepare_module_for_emulation(module, all_entrypoints, entry_point=entry_point)
 
         # Create an empty process object for the module if none is
         # supplied, only do this for the main module
@@ -315,8 +329,8 @@ class Win32Emulator(WindowsEmulator):
         self.curr_process.threads.append(t)  # type: ignore[union-attr]
         self.curr_thread = t
 
-        if self.run_queue:
-            self.run_queue[0].thread = t
+        for run in startup:
+            run.thread = t
 
         peb = self.alloc_peb(self.curr_process)
 
@@ -334,7 +348,8 @@ class Win32Emulator(WindowsEmulator):
             child = self.child_processes.pop(0)
 
             child.pe = self.load_module(data=child.pe_data)
-            self.prepare_module_for_emulation(child.pe, all_entrypoints)
+            for run in self.prepare_module_for_emulation(child.pe, all_entrypoints):
+                run.thread = child.threads[0]
 
             self.command_line = child.cmdline
 
@@ -363,18 +378,8 @@ class Win32Emulator(WindowsEmulator):
             mod_hash = mod_hash.hexdigest()  # type: ignore[assignment]
             self.mod_name = mod_hash
             self.file_name = f"{self.mod_name}.exe"
-        self.bin_base_name = os.path.basename(self.file_name)
-
-    def emulate_module(self, path):
-        """
-        Load and emulate binary from the given path
-        """
-        mod = self.load_module(path)
-        self.run_module(mod)
 
     def load_shellcode(self, path, arch, data=None, filename=None):
-        from speakeasy.windows.loaders import ShellcodeLoader
-
         self._init_name(path, data, filename=filename)
         if arch == "x86":
             arch = _arch.ARCH_X86
@@ -431,7 +436,7 @@ class Win32Emulator(WindowsEmulator):
 
         effective_stack = self.config.stack_size or stack_commit
         self.stack_base, stack_addr = self.alloc_stack(effective_stack)
-        self.set_func_args(self.stack_base, self.return_hook, 0x7000)
+        self.set_func_args(stack_addr, self.return_hook, 0x7000, conv=_arch.CALL_CONV_STDCALL)
 
         run = Run()
         run.type = "shellcode"
@@ -477,7 +482,7 @@ class Win32Emulator(WindowsEmulator):
         Allocate memory for the Process Environment Block (PEB)
         """
         if proc.is_peb_active:
-            return
+            return proc.peb
         size = proc.peb_ldr_data.sizeof()
         res, size = self.get_valid_ranges(size)
         self.mem_reserve(size, base=res, tag="emu.struct.PEB_LDR_DATA")
@@ -491,28 +496,42 @@ class Win32Emulator(WindowsEmulator):
         peb.object.OSBuildNumber = self.config.os_ver.build or 0
         peb.write_back()
 
-        self._ensure_core_dlls_loaded()
         self.mem_map_reserve(proc.peb_ldr_data.address)
-        self.init_peb(self._ordered_peb_modules())
+        main = proc.pe or next(
+            (module for module in self.modules if module.base == proc.base and module.is_exe()), None
+        )
+        if main is not None and main.visible_in_peb:
+            proc.add_module_to_peb(main)
+        proc.initializing_peb = True
+        try:
+            self._ensure_core_dlls_loaded()
+            self.init_peb(self._ordered_peb_modules(proc, include_defaults=True), proc=proc)
+        finally:
+            proc.initializing_peb = False
 
         return peb
 
-    def _ordered_peb_modules(self):
-        import os as _os
-
+    def _ordered_peb_modules(self, proc=None, *, include_defaults=False):
         CORE_ORDER = {"ntdll": 0, "kernel32": 1, "kernelbase": 2}
         mods = self.get_peb_modules()
+        proc = proc or self.get_current_process()
+        attached = set(proc._peb_modules) if proc is not None else set()
         exe_mods = []
         core_mods = []
         other_mods = []
         for m in mods:
+            if m.is_driver():
+                continue
             if m.is_exe():
-                exe_mods.append(m)
+                if proc is not None and (m is proc.pe or m.base == proc.base):
+                    exe_mods.append(m)
+                continue
+            if m.base not in attached and not (include_defaults and m.base in self._shared_peb_modules):
                 continue
             name = (m.name or "").lower()
             if not name:
                 bn = m.get_base_name()
-                name = _os.path.splitext(bn)[0].lower() if bn else ""
+                name = os.path.splitext(bn)[0].lower() if bn else ""
             if name in CORE_ORDER:
                 core_mods.append((CORE_ORDER[name], m))
             else:
@@ -525,6 +544,7 @@ class Win32Emulator(WindowsEmulator):
         for dll in CORE_DLLS:
             if not self.get_mod_by_name(dll):
                 self.load_module_by_name(dll)
+            self._shared_peb_modules.add(self.get_mod_by_name(dll).base)
 
     def set_unhandled_exception_handler(self, handler_addr):
         """
@@ -558,6 +578,8 @@ class Win32Emulator(WindowsEmulator):
         Get the system modules (e.g. drivers) that are loaded in the emulator
         """
         rtmods = super().init_sys_modules(modules_config)
+        for mod in rtmods:
+            mod.visible_in_peb = False
 
         for modconf in modules_config:
             drv = modconf.driver
@@ -580,6 +602,8 @@ class Win32Emulator(WindowsEmulator):
                 base = p.base_addr or 0
                 if isinstance(base, str):
                     base = int(base, 0)
+                if self.container_image:
+                    base = self.container_image.base
                 cmd_line = p.command_line or ""
 
                 proc = objman.Process(self, name=name, path=emu_path, base=base, cmdline=cmd_line)
@@ -593,12 +617,19 @@ class Win32Emulator(WindowsEmulator):
                 proc_mod = p
                 break
 
+        # Setup runs while the input module loads, so it is the only module so far.
+        # An EXE input is its own process image and needs no container image.
+        if self.modules and self.modules[0].is_exe():
+            proc_mod = None
+
         if proc_mod:
             all_user_mods = [proc_mod] + list(self.config.modules.user_modules)
         else:
             all_user_mods = list(self.config.modules.user_modules)
 
-        self.init_user_modules(all_user_mods)
+        rtmods = self.init_user_modules(all_user_mods)
+        if proc_mod:
+            self.container_image = rtmods[0]
 
     def exit_process(self):
         """
@@ -628,6 +659,11 @@ class Win32Emulator(WindowsEmulator):
         if not self.builtin_hooks_set:
             self.add_mem_invalid_hook(cb=self._hook_mem_unmapped)
             self.add_interrupt_hook(cb=self._hook_interrupt)
+            self.add_invalid_instruction_hook(cb=self._hook_invalid_instruction)
+            if self.config.exceptions.dispatch_handlers:
+                # User mode cannot execute these; Windows raises an exception instead
+                self.emu_eng.hook_add(htype=common.HOOK_INSN, cb=self._hook_in_instruction, arg1=UC_X86_INS_IN)
+                self.emu_eng.hook_add(htype=common.HOOK_INSN, cb=self._hook_out_instruction, arg1=UC_X86_INS_OUT)
             self.builtin_hooks_set = True
 
         self.set_mem_tracing_hooks()

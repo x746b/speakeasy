@@ -31,7 +31,11 @@ WSA_FLAG_ACCESS_SYSTEM_SECURITY = 0x40
 WSA_FLAG_NO_HANDLE_INHERIT = 0x80
 
 HOST_NOT_FOUND = 11001
+SOCKET_ERROR = 0xFFFFFFFF
+WSAEFAULT = 10014
 WSAENOTSOCK = 10038
+WSAENOTCONN = 10057
+WSATYPE_NOT_FOUND = 10109
 
 MSG_PEEK = 0x2
 
@@ -76,7 +80,3 @@ def get_addr_family(define):
 
 def get_sock_type(define):
     return get_define(define, prefix="SOCK_")
-
-
-def get_proto_type(define):
-    return get_define(define, prefix="IPPROTO_")

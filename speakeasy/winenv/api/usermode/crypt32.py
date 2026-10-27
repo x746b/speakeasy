@@ -19,7 +19,6 @@ class Crypt32(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs = {}
@@ -28,7 +27,7 @@ class Crypt32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("CryptStringToBinary", argc=7)
-    def CryptStringToBinary(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptStringToBinary(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptStringToBinaryA(
         LPCSTR pszString,
@@ -40,8 +39,6 @@ class Crypt32(api.ApiHandler):
         DWORD  *pdwFlags
         );
         """
-        ctx = ctx or {}
-
         cw = self.get_char_width(ctx)
 
         pszString, cchString, dwFlags, pbBinary, pcbBinary, pdwSkip, pdwFlags = argv
@@ -58,7 +55,7 @@ class Crypt32(api.ApiHandler):
         if not isinstance(s, str):
             s = s.decode("utf8")
 
-        argv[0] = s
+        ctx.args["pszString"].display = s
 
         try:
             decoded = base64.b64decode(s)
@@ -70,7 +67,7 @@ class Crypt32(api.ApiHandler):
 
         if pbBinary == 0:
             self.mem_write(pcbBinary, out_len.to_bytes(4, "little"))
-            return out_len
+            return 1
 
         if out_len > cbBinary:
             emu.set_last_error(ERROR_MORE_DATA)

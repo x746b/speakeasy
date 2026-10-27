@@ -61,7 +61,6 @@ class CMeta(type):
         return type.__new__(self, name, bases, classdict)
 
     def __call__(cls, *args, **kwargs):
-
         obj = type.__call__(cls, *args, **kwargs)
         obj.create_struct()
         return obj
@@ -80,14 +79,13 @@ class EmuStruct(metaclass=CMeta):
     # to assign structures even if the types are identical on the surface.
     # ctypes will test the id (address) of the type to make sure they match
     # upon assignment. Otherwise we will hit spurious TypeErrors.
-    __types__: dict[str, type] = {}
+    __types__: dict[tuple, type] = {}
 
     class FilteredStruct(ct.Structure):
         def __hash__(self):
             return hash(repr(self))
 
     def __init__(self, ptr_size=0, pack=0):
-
         # Set __dict__ directly here to avoid __getattribute__ loops
         self.__dict__["__pack__"] = pack
         self.__dict__["__struct__"] = None
@@ -227,7 +225,6 @@ class EmuStruct(metaclass=CMeta):
         return ct.sizeof(self.__struct__)
 
     def _deep_cast(self, obj, bytez, offset):
-
         obj.__struct__ = type(obj.__struct__).from_buffer(bytearray(bytez[offset[0] :]))
         for fn, c in obj.__fields__:
             subobj = obj.__filtermap__.get(fn)
@@ -251,41 +248,20 @@ class EmuStruct(metaclass=CMeta):
     def get_cstruct(self):
         return self.__struct__.__class__
 
-    def get_sub_field_name(self, cstruc, offset):
-        for name, t in cstruc._fields_:
-            noff = cstruc.__dict__[name].offset
-            nsize = cstruc.__dict__[name].size
-            if offset == noff:
-                return name
-            elif noff < offset < noff + nsize:
-                # access into the sub-structure recursively
-                return name + "." + self.get_sub_field_name(t, offset - noff)
-
-    def get_field_name(self, offset):
-        cstruc = self.get_cstruct()
-        for name, t in self.__fields__:
-            noff = cstruc.__dict__[name].offset
-            nsize = cstruc.__dict__[name].size
-            if offset == noff:
-                return name
-            elif noff < offset < noff + nsize:
-                # access into the sub-structure
-                return name + "." + self.get_sub_field_name(t, offset - noff)
-        return None
-
     def __struct_factory(self, name):
         """
         Factory used to generate ctypes structures using the ctypes metaclass
         """
         _type_name = f"ct{name}{self.__ptrsize__}"
-        _type = EmuStruct.__types__.get(_type_name)
+        key = (_type_name, self.get_pack(), tuple(self.__fields__))
+        _type = EmuStruct.__types__.get(key)
         if not _type:
             _type = type(
                 _type_name,
                 (self.__class__.FilteredStruct,),
                 {"_pack_": self.get_pack(), "_layout_": "ms", "_fields_": self.__fields__},
             )
-            EmuStruct.__types__[_type_name] = _type
+            EmuStruct.__types__[key] = _type
         return _type
 
     def __init_struct(self):

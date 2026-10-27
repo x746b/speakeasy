@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import shlex
+import sys
 import time
 
 from rich.console import Console
@@ -25,11 +26,13 @@ from speakeasy.volumes import apply_volumes
 
 logger = logging.getLogger(__name__)
 
+CHILD_EXIT_GRACE = 5
+
 
 def setup_logging(verbose: bool) -> None:
     root = logging.getLogger("speakeasy")
     root.handlers.clear()
-    root.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    root.addHandler(RichHandler(console=Console(stderr=True), show_path=False, show_time=False, show_level=False))
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
@@ -47,13 +50,21 @@ def emulate_binary(
     emulate_children=False,
     verbose=False,
     gdb_port=None,
+    gdb_host="127.0.0.1",
 ):
     setup_logging(verbose)
 
     report = None
+    error = None
     se = None
     try:
-        se = Speakeasy(config=cfg, argv=argv, exit_event=exit_event, gdb_port=gdb_port)
+        se = Speakeasy(
+            config=cfg,
+            argv=argv,
+            exit_event=exit_event,
+            gdb_port=gdb_port,
+            gdb_host=gdb_host,
+        )
         if do_raw:
             arch = arch.lower()
             if arch == "x86":
@@ -73,12 +84,19 @@ def emulate_binary(
                 emulate_children=emulate_children,
                 entry_point=entry_point,
             )
+    except Exception as err:
+        logger.debug("emulation failed", exc_info=True)
+        error = str(err) or type(err).__name__
     finally:
-        if se is not None:
-            report = se.get_json_report()
-        q.put(report)
+        if se is not None and se.emu is not None:
+            try:
+                report = se.get_json_report()
+            except Exception as err:
+                logger.debug("report generation failed", exc_info=True)
+                error = error or f"failed to build the report: {err or type(err).__name__}"
+        q.put((report, error))
 
-        if dropped_files_path and se is not None:
+        if dropped_files_path and se is not None and se.emu is not None:
             data = se.create_file_archive()
             if data:
                 logger.info("* Saving dropped files archive to %s", dropped_files_path)
@@ -88,7 +106,56 @@ def emulate_binary(
                 logger.info("* No dropped files found")
 
 
-def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_specs) -> None:
+def get_child_result(q, p, wait):
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            return q.get(timeout=max(min(deadline - time.monotonic(), 1), 0.01))
+        except mp.queues.Empty:  # type: ignore[attr-defined]
+            if not p.is_alive():
+                try:
+                    return q.get(timeout=1)
+                except mp.queues.Empty:  # type: ignore[attr-defined]
+                    return None
+            if time.monotonic() >= deadline:
+                return None
+
+
+def wait_for_child(q, p, evt, wall_limit) -> tuple[str | None, str | None]:
+    """
+    Wait for the result of the emulation process and stop it after ``wall_limit`` seconds.
+    A child that exits or stops without a result gives an error.
+    """
+    result = None
+    start_time = time.time()
+    while True:
+        if wall_limit and wall_limit < (time.time() - start_time):
+            evt.set()
+            logger.error("* Child process timeout reached after %d seconds", wall_limit)
+            result = get_child_result(q, p, CHILD_EXIT_GRACE)
+            break
+        try:
+            result = get_child_result(q, p, 1)
+            if result is not None or not p.is_alive():
+                break
+        except KeyboardInterrupt:
+            evt.set()
+            logger.error("\n* User exited")
+            result = get_child_result(q, p, CHILD_EXIT_GRACE)
+            break
+
+    if result is None:
+        p.join(CHILD_EXIT_GRACE)
+        if p.is_alive():
+            p.terminate()
+    p.join()
+
+    if result is None:
+        return None, f"emulation process exited with code {p.exitcode} and sent no report"
+    return result
+
+
+def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_specs) -> str | None:
     target = args.target
     output = args.output
     dropped_files_path = args.dropped_files_path
@@ -101,13 +168,13 @@ def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_s
     argv = shlex.split(args.argv) if args.argv else []
     verbose = args.verbose
     gdb_port = args.gdb_port if args.gdb else None
+    gdb_host = args.gdb_host
 
     setup_logging(verbose)
 
     if args.gdb and not args.no_mp:
         args.no_mp = True
         logger.info("--gdb requires --no-mp mode; enabling automatically")
-
     cfg = get_default_config_dict()
 
     if config_path:
@@ -128,7 +195,7 @@ def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_s
         parser.error(f"Invalid active configuration: {err}")
 
     active_cfg = validated.model_dump(mode="python")
-    timeout = float(validated.timeout)
+    wall_limit = max(validated.timeout, validated.max_total_time) if validated.timeout else 0
 
     if target and not os.path.isfile(target):
         parser.error(f"Target file not found: {target}")
@@ -154,8 +221,9 @@ def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_s
             emulate_children=emulate_children,
             verbose=verbose,
             gdb_port=gdb_port,
+            gdb_host=gdb_host,
         )
-        report = q.get()
+        result = q.get()
     else:
         p = mp.Process(
             target=emulate_binary,
@@ -175,42 +243,21 @@ def run_main(parser: argparse.ArgumentParser, args: argparse.Namespace, config_s
                 "emulate_children": emulate_children,
                 "verbose": verbose,
                 "gdb_port": gdb_port,
+                "gdb_host": gdb_host,
             },
         )
         p.start()
-
-        report = None
-        start_time = time.time()
-        while True:
-            if timeout and timeout < (time.time() - start_time):
-                evt.set()
-                logger.error("* Child process timeout reached after %d seconds", timeout)
-                try:
-                    report = q.get(timeout=5)
-                except mp.queues.Empty:  # type: ignore[attr-defined]
-                    pass
-                break
-            try:
-                report = q.get(timeout=1)
-                break
-            except mp.queues.Empty:  # type: ignore[attr-defined]
-                if not p.is_alive():
-                    break
-            except KeyboardInterrupt:
-                evt.set()
-                logger.error("\n* User exited")
-                try:
-                    report = q.get(timeout=5)
-                except mp.queues.Empty:  # type: ignore[attr-defined]
-                    pass
-                break
+        result = wait_for_child(q, p, evt, wall_limit)
 
     logger.info("* Finished emulating")
+    report, error = result
 
     if report and output:
         logger.info("* Saving emulation report to %s", output)
         with open(output, "w") as f:
             f.write(report)
+
+    return error
 
 
 def main():
@@ -310,6 +357,14 @@ def main():
         help="Enable GDB server stub (pauses before first instruction)",
     )
     parser.add_argument(
+        "--gdb-host",
+        action="store",
+        dest="gdb_host",
+        default="127.0.0.1",
+        required=False,
+        help="GDB server bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
         "--gdb-port",
         action="store",
         dest="gdb_port",
@@ -334,7 +389,10 @@ def main():
     if args.dump_default_config:
         print(json.dumps(get_default_config_dict(), indent=4))
         return
-    run_main(parser, args, config_specs)
+    error = run_main(parser, args, config_specs)
+    if error:
+        logger.error("error: %s", error)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

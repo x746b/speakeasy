@@ -4,6 +4,7 @@ import hashlib
 import ntpath
 import os
 
+import speakeasy.common as common
 import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ddk as ddk
@@ -12,6 +13,7 @@ import speakeasy.winenv.defs.registry.reg as regdefs
 from speakeasy.errors import KernelEmuError
 from speakeasy.profiler import Run
 from speakeasy.windows.ioman import IoManager
+from speakeasy.windows.loaders import PeLoader
 from speakeasy.windows.winemu import BootstrapPhase, WindowsEmulator
 
 EP_DRIVER_ENTRY = ddk.IRP_MJ_MAXIMUM_FUNCTION
@@ -27,8 +29,8 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
     Class used to emulate Windows drivers
     """
 
-    def __init__(self, config, debug=False, exit_event=None, gdb_port=None):
-        super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port)
+    def __init__(self, config, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
+        super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port, gdb_host=gdb_host)
 
         self.disasm_eng: object | None = None
         self.curr_mod: object | None = None
@@ -65,19 +67,12 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         """
         self.irql = irql
 
-    def create_driver_object(self, name=None, pe=None):
+    def create_driver_object(self, pe, name=None):
         """
-        Create a driver object for the driver that is going to be emulated
+        Create a driver object for a loaded driver image
         """
-        from speakeasy.windows.common import _PeParser
-
         drv = objman.Driver(emu=self)
-
-        if not pe:
-            default_path = self.get_native_module_path("default_sys")
-            pe = _PeParser(path=default_path)
-
-        drv.init_driver_object(name, pe, is_decoy=False)
+        drv.init_driver_object(name, pe)
 
         self.add_object(drv)
 
@@ -101,8 +96,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         self.setup_user_shared_data()
 
     def load_module(self, path=None, data=None, filename=None):
-        from speakeasy.windows.loaders import PeLoader
-
         if filename:
             file_name = ntpath.basename(filename)
             mod_name = os.path.splitext(file_name)[0]
@@ -375,7 +368,7 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         Call a WDM driver dispatch function with a supplied IRP
         """
         stk_ptr = self.get_stack_ptr()
-        self.set_func_args(stk_ptr, self.return_hook, dev_addr, irp_addr)
+        self.set_func_args(stk_ptr, self.return_hook, dev_addr, irp_addr, conv=_arch.CALL_CONV_STDCALL)
         self.set_pc(func)
 
     def new_irp(self):
@@ -385,7 +378,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         return objman.Irp(emu=self)
 
     def irp_mj_create(self, func, dev):
-
         # Generate an IRP for the create request
         irp = self.new_irp()
 
@@ -438,7 +430,7 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
             return
 
         stk_ptr = self.get_stack_ptr()
-        self.set_func_args(stk_ptr, self.exit_hook, drv.address)
+        self.set_func_args(stk_ptr, self.exit_hook, drv.address, conv=_arch.CALL_CONV_STDCALL)
         self.set_pc(drv.on_unload)
 
         run = Run()
@@ -451,7 +443,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         drv.unload_called = True
 
     def next_driver_func(self, drv):
-
         func_addr = None
         func_handler = None
 
@@ -507,7 +498,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         self.add_run(run)
 
     def on_run_complete(self):
-
         self.curr_run.ret_val = self.get_return_val()  # type: ignore[union-attr]
 
         for drv in self.drivers:
@@ -538,6 +528,7 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         if not self.builtin_hooks_set:
             self.add_mem_invalid_hook(cb=self._hook_mem_unmapped)
             self.add_interrupt_hook(cb=self._hook_interrupt)
+            self.add_invalid_instruction_hook(cb=self._hook_invalid_instruction)
             self.builtin_hooks_set = True
 
         self.set_mem_tracing_hooks()
@@ -589,7 +580,6 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         return self.ssdt_ptr
 
     def setup_kernel_mode(self):
-
         idt = objman.IDT(self)
         idt.init_descriptors()
 
@@ -600,9 +590,9 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         ssdt = self.ktypes.SSDT(self.get_ptr_size())
         size = self.get_ptr_size() * 256
 
-        self.ssdt_ptr = self.mem_map(size, base=None, tag="api.struct.SSDT")
+        self.ssdt_ptr = self.get_proc("ntoskrnl", "KeServiceDescriptorTable")
         ssdt.NumberOfServices = 256
-        ssdt.pServiceTable = self.ssdt_ptr + self.sizeof(ssdt)
+        ssdt.pServiceTable = self.mem_map(size, base=None, tag="api.struct.SSDT.services")
         self.mem_write(self.ssdt_ptr, self.get_bytes(ssdt))
 
         self.setup_msrs()
@@ -617,32 +607,29 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         km = self.get_kernel_mod()
 
         if self.get_arch() == _arch.ARCH_AMD64 and km.image_size > 0:
-            kbase = km.base
-            km_data = bytes(self.mem_read(kbase, km.image_size))
-            ksc64_off = km_data.find(b"\x00" * 100)
-            if ksc64_off != -1:
-                sdt_entry = km.get_export_by_name("KeServiceDescriptorTable")
-                sdt_addr = sdt_entry.address if sdt_entry else None
-                if sdt_addr:
-                    for i in range(0x20):
-                        self.symbols.update({sdt_addr + i: (km.get_base_name(), "KeServiceDescriptorTable")})
-                    self.symbols.update({sdt_addr: (km.get_base_name(), "KeServiceDescriptorTable.pServiceTable")})
-                    self.symbols.update(
-                        {sdt_addr + 0x10: (km.get_base_name(), "KeServiceDescriptorTable.NumberOfServices")}
-                    )
-                    ksc64_off += 5
+            sdt_entry = km.get_export_by_name("KeServiceDescriptorTable")
+            sdt_addr = sdt_entry.address if sdt_entry else None
+            if sdt_addr:
+                for i in range(0x20):
+                    self.symbols.update({sdt_addr + i: (km.get_base_name(), "KeServiceDescriptorTable")})
+                self.symbols.update({sdt_addr: (km.get_base_name(), "KeServiceDescriptorTable.pServiceTable")})
+                self.symbols.update(
+                    {sdt_addr + 0x10: (km.get_base_name(), "KeServiceDescriptorTable.NumberOfServices")}
+                )
 
-                    ksc64_addr = kbase + ksc64_off
-                    self.symbols.update({ksc64_addr: (km.get_base_name(), "KiSystemCall64")})
-
-                    self.reg_write(_arch.X86_REG_MSR, (_arch.LSTAR, ksc64_addr))
-                    sdt_offset = (sdt_addr - ksc64_addr) - 7
-                    data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little")
-                    self.mem_write(kbase + ksc64_off, data)
-                    ksc64_off += 7
-                    sdt_offset = sdt_addr - (kbase + ksc64_off)
-                    data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little")
-                    self.mem_write(kbase + ksc64_off, data)
-                    ksc64_off += 7
-                    data = b"\x90\x90\x90\x90\x90\x90\xc3"
-                    self.mem_write(kbase + ksc64_off, data)
+                # Map the compatibility stub next to the kernel image so that its
+                # 32-bit relative offsets reach the SSDT.
+                ksc64_addr = self.mem_map(
+                    self.page_size,
+                    base=km.base + km.image_size,
+                    perms=common.PERM_MEM_RX,
+                    tag="emu.KiSystemCall64",
+                )
+                self.symbols.update({ksc64_addr: (km.get_base_name(), "KiSystemCall64")})
+                self.reg_write(_arch.X86_REG_MSR, (_arch.LSTAR, ksc64_addr))
+                sdt_offset = sdt_addr - ksc64_addr - 7
+                data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little", signed=True)
+                second_offset = sdt_addr - ksc64_addr - 14
+                data += b"\x90\x90\xc3" + second_offset.to_bytes(4, "little", signed=True)
+                data += b"\x90\x90\x90\x90\x90\x90\xc3"
+                self.mem_write(ksc64_addr, data)

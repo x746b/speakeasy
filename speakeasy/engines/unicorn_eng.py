@@ -3,7 +3,6 @@
 # Unicorn specific wrappers and abstraction implemented here
 
 import ctypes as ct
-import platform
 
 import unicorn as uc
 import unicorn.x86_const as u
@@ -25,15 +24,9 @@ from speakeasy.errors import EmuEngineError
 
 uc_engine = ct.c_void_p
 UC_HOOK_INSN_IN_CB = ct.CFUNCTYPE(ct.c_uint32, uc_engine, ct.c_uint32, ct.c_int, ct.c_void_p)
+UC_HOOK_INSN_OUT_CB = ct.CFUNCTYPE(None, uc_engine, ct.c_uint32, ct.c_int, ct.c_uint32, ct.c_void_p)
 UC_HOOK_INSN_SYSCALL_CB = ct.CFUNCTYPE(None, uc_engine, ct.c_void_p)
 hook_id = uc_hook_h()
-
-
-def is_platform_intel():
-    mach = platform.machine()
-    if mach in ("x86_64", "i386", "x86"):
-        return True
-    return False
 
 
 class ToggleableHook:
@@ -122,6 +115,7 @@ class EmuEngine:
             common.PERM_MEM_WRITE: uc.UC_PROT_WRITE,
             common.PERM_MEM_RW: uc.UC_PROT_READ | uc.UC_PROT_WRITE,
             common.PERM_MEM_RX: uc.UC_PROT_READ | uc.UC_PROT_EXEC,
+            common.PERM_MEM_WRITE | common.PERM_MEM_EXEC: uc.UC_PROT_WRITE | uc.UC_PROT_EXEC,
             common.PERM_MEM_RWX: uc.UC_PROT_ALL,
         }
 
@@ -175,7 +169,11 @@ class EmuEngine:
 
     def mem_write(self, addr, data):
         """Write data into the address space of the engine"""
-        return self.emu.mem_write(addr, data)  # type: ignore[union-attr]
+        result = self.emu.mem_write(addr, data)  # type: ignore[union-attr]
+        if data:
+            # Host/debugger writes must invalidate already translated stub bytes.
+            self.emu.ctl_remove_cache(addr, addr + len(data))  # type: ignore[union-attr]
+        return result
 
     def mem_read(self, addr, size):
         """Read data from the address space of the engine"""
@@ -184,7 +182,16 @@ class EmuEngine:
     def mem_protect(self, addr, size, perms):
         """Change the memory protections for pages in the emu engine"""
         perm = self.perms.get(perms, uc.UC_PROT_ALL)
-        return self.emu.mem_protect(addr, size, perm)  # type: ignore[union-attr]
+        result = self.emu.mem_protect(addr, size, perm)  # type: ignore[union-attr]
+        # Unicorn keeps translations and TLB entries made under the old protections,
+        # which would let code run or memory be read that the new ones deny.
+        self.invalidate_translations(addr, addr + size)
+        self.emu.ctl(uc.UC_CTL_TLB_FLUSH, uc.UC_CTL_IO_WRITE)  # type: ignore[union-attr]
+        return result
+
+    def invalidate_translations(self, begin, end):
+        """Drop the translated code of [begin, end), e.g. so that a code hook added since applies to it"""
+        self.emu.ctl_remove_cache(begin, end)  # type: ignore[union-attr]
 
     def reg_write(self, reg, val):
         """Modify register values"""
@@ -229,6 +236,8 @@ class EmuEngine:
         if hook_type == uc.UC_HOOK_INSN:
             if arg1 == u.UC_X86_INS_IN:  # IN instruction
                 cb = ct.cast(UC_HOOK_INSN_IN_CB(cb), UC_HOOK_INSN_IN_CB)
+            elif arg1 == u.UC_X86_INS_OUT:  # OUT instruction
+                cb = ct.cast(UC_HOOK_INSN_OUT_CB(cb), UC_HOOK_INSN_OUT_CB)
             elif arg1 in (u.UC_X86_INS_SYSCALL, u.UC_X86_INS_SYSENTER):  # SYSCALL/SYSENTER
                 cb = ct.cast(UC_HOOK_INSN_SYSCALL_CB(cb), UC_HOOK_INSN_SYSCALL_CB)
         elif hook_type == uc.UC_HOOK_CODE:
@@ -271,7 +280,13 @@ class EmuEngine:
             return hook.disable()
 
     def hook_remove(self, hid):
-        return self.emu.hook_del(hid)  # type: ignore[union-attr]
+        if hid not in self._callbacks:
+            return self.emu.hook_del(hid)  # type: ignore[union-attr]
+
+        status = _uc.uc_hook_del(self.emu._uch, uc_hook_h(hid))  # type: ignore[union-attr]
+        if status != uc.UC_ERR_OK:
+            raise uc.UcError(status)
+        self._callbacks.pop(hid, None)
 
     def close(self):
         if self.emu is None:

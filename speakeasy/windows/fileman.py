@@ -9,8 +9,8 @@ import os
 import shlex
 from typing import Any
 
-import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.config import FileEntryFullPath
 from speakeasy.errors import FileSystemEmuError
 
 logger = logging.getLogger(__name__)
@@ -40,14 +40,23 @@ class MapView:
         self.process = process
 
 
+def get_object_name_key(name):
+    name = name.lower()
+    if "basenamedobjects\\" in name:
+        name = name.split("basenamedobjects\\", 1)[1]
+    for prefix in ("global\\", "local\\"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
 class FileMap:
     """
     Represents a memory mapped file
     """
 
-    curr_handle = 0x280
-
-    def __init__(self, name, size, prot, backed_file=None):
+    def __init__(self, allocator, name, size, prot, backed_file=None):
+        self.allocator = allocator
         self.name = name
         self.backed_file = backed_file
         self.views = {}
@@ -55,9 +64,7 @@ class FileMap:
         self.prot = prot
 
     def get_handle(self):
-        hmap = FileMap.curr_handle
-        FileMap.curr_handle += 4
-        return hmap
+        return self.allocator.allocate_file_map_handle()
 
     def add_view(self, base, offset, size, protect):
         view = MapView(base, offset, size, protect)
@@ -69,98 +76,94 @@ class File:
     Base class for an emulated file
     """
 
-    curr_handle = 0x80
-
-    def __init__(self, path, config=None, data=b""):
+    def __init__(self, allocator, path, config=None, data=b""):
+        self.allocator = allocator
         self.path: str = path
-        self.data: io.BytesIO | bytes | None = None
+        self.data: io.BytesIO | None = None
+        self.pos: int = 0
+        self.origin: File | None = None
         self.bytes_written: int = 0
         if data:
             self.data = io.BytesIO(data)
-        self.curr_offset: int = 0
         self.is_dir: bool = False
         self.config: Any = config if config is not None else {}
 
+    def get_buffer(self) -> io.BytesIO:
+        if self.data is None:
+            self.data = self.handle_file_data() if self.config else io.BytesIO()
+        return self.data
+
     def duplicate(self):
-        if not self.data and self.config:
-            self.data = self.handle_file_data()
-
-        if isinstance(self.data, io.BytesIO):
-            data = self.data.getvalue()
-        elif isinstance(self.data, bytes):
-            data = self.data
-        else:
-            data = b""
-
-        new = File(self.path, config=self.config, data=data)
+        """
+        Get a new file object for another handle: it shares the contents and has its own position.
+        """
+        new = File(self.allocator, self.path, config=self.config)
+        new.data = self.get_buffer()
+        new.origin = self.origin or self
         new.is_dir = self.is_dir
         return new
 
     def get_handle(self):
-        hfile = File.curr_handle
-        File.curr_handle += 4
-        return hfile
+        return self.allocator.allocate_file_handle()
 
     def get_hash(self):
-        h = hashlib.sha256()
-        data = self.get_data(reset_pointer=True)
-        h.update(data)
-        return h.hexdigest()
+        return hashlib.sha256(self.get_contents()).hexdigest()
 
     def get_size(self):
-        if not self.data and self.config:
-            self.data = self.handle_file_data()
-        if not self.data:
-            return 0
-        off = self.data.tell()
-        self.data.seek(0, io.SEEK_SET)
-        size = len(self.data.read())
-        self.data.seek(off, io.SEEK_SET)
-        return size
+        return self.get_buffer().seek(0, io.SEEK_END)
 
     def get_data(self, size=-1, reset_pointer=False):
-        if not self.data and self.config:
-            self.data = self.handle_file_data()
-
-        if not self.data:
-            return b""
-
-        off = self.data.tell()
-        if off == self.get_size():
-            if reset_pointer:
-                # Reset the file pointer
-                self.data.seek(0)
-            else:
+        buf = self.get_buffer()
+        if self.pos == self.get_size():
+            if not reset_pointer:
                 return b""
+            self.pos = 0
+        buf.seek(self.pos)
+        data = buf.read(size)
+        self.pos = buf.tell()
+        return data
 
-        return self.data.read(size)
+    def get_contents(self):
+        """
+        Return all the file data and keep the file pointer.
+        """
+        return self.get_buffer().getvalue()
 
     def seek(self, offset, whence):
         if whence not in [io.SEEK_CUR, io.SEEK_SET, io.SEEK_END]:
             return
-        if self.data:
-            self.data.seek(offset, whence)
+        buf = self.get_buffer()
+        buf.seek(self.pos)
+        self.pos = buf.seek(offset, whence)
 
     def tell(self):
-        if self.data:
-            return self.data.tell()
-        return None
+        return self.pos
 
     def add_data(self, data):
-
-        if not self.data:
-            self.data = io.BytesIO()
-        off = self.data.tell()
-        self.data.seek(0, io.SEEK_END)
-        self.data.write(data)
-        self.data.seek(off, io.SEEK_SET)
+        buf = self.get_buffer()
+        buf.seek(0, io.SEEK_END)
+        buf.write(data)
         self.bytes_written += len(data)
+        if self.origin:
+            self.origin.bytes_written += len(data)
+
+    def write_data(self, data):
+        """
+        Write data at the file pointer and move the file pointer past it.
+        """
+        buf = self.get_buffer()
+        buf.seek(self.pos)
+        buf.write(data)
+        self.pos = buf.tell()
+        self.bytes_written += len(data)
+        if self.origin:
+            self.origin.bytes_written += len(data)
 
     def remove_data(self):
-        self.data = io.BytesIO(b"")
-
-    def is_directory(self):
-        return self.is_dir
+        buf = self.get_buffer()
+        buf.seek(0)
+        buf.truncate()
+        self.pos = 0
 
     def handle_file_data(self):
         """
@@ -184,7 +187,7 @@ class File:
                 byte = 0xFF & int(byte, 16)
             size = bf.size
             b = (byte).to_bytes(1, "little")
-            return b * size
+            return io.BytesIO(b * size)
         return io.BytesIO(b"")
 
 
@@ -193,10 +196,8 @@ class Pipe(File):
     Emulated named pipe objects
     """
 
-    curr_handle = 0x400
-
-    def __init__(self, name, mode, num_instances, out_size, in_size, config=None):
-        super().__init__(path=name, config=config)
+    def __init__(self, allocator, name, mode, num_instances, out_size, in_size, config=None):
+        super().__init__(allocator, path=name, config=config)
         self.name = name
         self.mode = mode
         self.num_instances = num_instances
@@ -204,9 +205,7 @@ class Pipe(File):
         self.in_size = in_size
 
     def get_handle(self):
-        hpipe = Pipe.curr_handle
-        Pipe.curr_handle += 4
-        return hpipe
+        return self.allocator.allocate_pipe_handle()
 
 
 class FileManager:
@@ -243,12 +242,12 @@ class FileManager:
     def file_create_mapping(self, hfile, name, size, prot):
         if hfile not in (windefs.INVALID_HANDLE_VALUE, 0):
             f = self.get_file_from_handle(hfile)
-            fm = FileMap(name, size, prot, f)
+            fm = FileMap(self.emu.handle_allocator, name, size, prot, f)
             hnd = fm.get_handle()
             self.file_maps.update({hnd: fm})
             return hnd
         else:
-            fm = FileMap(name, size, prot, None)
+            fm = FileMap(self.emu.handle_allocator, name, size, prot, None)
             hnd = fm.get_handle()
             self.file_maps.update({hnd: fm})
             return hnd
@@ -289,7 +288,19 @@ class FileManager:
                 yield (child, is_dir)
 
     def get_dropped_files(self):
-        return [f for f in self.files if f.bytes_written == f.get_size()]
+        return [f for f in self.files if f.bytes_written >= f.get_size()]
+
+    def open_mapping(self, name):
+        """
+        Open a new handle to the named file mapping, or return None when no mapping has the name.
+        """
+        key = get_object_name_key(name)
+        for fm in list(self.file_maps.values()):
+            if fm.name and get_object_name_key(fm.name) == key:
+                hnd = fm.get_handle()
+                self.file_maps[hnd] = fm
+                return hnd
+        return None
 
     def get_mapping_from_handle(self, handle):
         return self.file_maps.get(handle)
@@ -322,32 +333,12 @@ class FileManager:
                 return f
         return None
 
-    def get_all_files(self):
-        return self.files
-
-    def handle_file_data(self, fconf):
-        path = getattr(fconf, "path", None)
-        if path:
-            path = normalize_response_path(path)
-            with open(path, "rb") as f:
-                return f.read()
-        bf = getattr(fconf, "byte_fill", None)
-        if bf:
-            byte = bf.byte if hasattr(bf, "byte") else bf.get("byte")
-            if byte.startswith("0x"):
-                byte = 0xFF & int(byte, 0)
-            else:
-                byte = 0xFF & int(byte, 16)
-            size = bf.size if hasattr(bf, "size") else bf.get("size")
-            b = (byte).to_bytes(1, "little")
-            return b * size
-
     def add_existing_file(self, path, data):
         """
         Register an existing file already included in the emulation space
         (with data)
         """
-        f = File(path, data=data)
+        f = File(self.emu.handle_allocator, path, data=data)
         self.files.append(f)
         return f
 
@@ -355,7 +346,7 @@ class FileManager:
         f = self.get_file_from_path(path)
         if f:
             self.files.remove(f)
-        f = File(path)
+        f = File(self.emu.handle_allocator, path)
         self.files.append(f)
         return f
 
@@ -379,27 +370,10 @@ class FileManager:
                 if fnmatch.fnmatch(path.lower(), f.emu_path.lower()):
                     return f
 
-        all_modules = self.config.modules
-
-        if self.emu.arch == _arch.ARCH_X86:
-            decoy_dir = all_modules.module_directory_x86 or ""
-        else:
-            decoy_dir = all_modules.module_directory_x64 or ""
-
-        ext = os.path.splitext(path)[1]
-
-        # Check if we can load the contents of a decoy DLL
-        for f in all_modules.user_modules:
-            if f.path == path:
-                newconf = dict()
-                newconf["path"] = os.path.join(decoy_dir, f.name + ext)
-                return newconf
-
-        for f in all_modules.system_modules:
-            if f.path == path:
-                newconf = dict()
-                newconf["path"] = os.path.join(decoy_dir, f.name + ext)
-                return newconf
+        # Configured modules exist on disk, without content.
+        modules = self.config.modules
+        if any(f.path == path for f in (*modules.user_modules, *modules.system_modules)):
+            return FileEntryFullPath(mode="full_path", emu_path=path)
 
         # If no full path handler exists, do we have an extension handler?
         for f in self.file_config.files:
@@ -420,7 +394,7 @@ class FileManager:
         fconf = self.get_emu_file(path)
         if not fconf:
             fconf = {}
-        p = Pipe(path, mode, num_instances, out_size, in_size, config=fconf)
+        p = Pipe(self.emu.handle_allocator, path, mode, num_instances, out_size, in_size, config=fconf)
         hnd = p.get_handle()
         self.pipe_handles.update({hnd: p})
         return hnd
@@ -472,12 +446,12 @@ class FileManager:
             if not truncate:
                 if real_path and not os.path.exists(real_path):
                     raise FileSystemEmuError(f"File path not found: {real_path}")
-                f = File(path, config=fconf)
+                f = File(self.emu.handle_allocator, path, config=fconf)
                 self.files.append(f)
             else:
                 if real_path and not os.path.exists(real_path):
                     raise FileSystemEmuError(f"File path not found: {real_path}")
-                f = File(path, config=fconf)
+                f = File(self.emu.handle_allocator, path, config=fconf)
                 self.files.append(f)
             hnd = f.get_handle()
             self.file_handles.update({hnd: f})

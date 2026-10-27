@@ -57,13 +57,10 @@ class BinaryEmulator(MemoryManager, ABC):
         ...
 
     def __init__(self, config):
-
         super().__init__()
 
         self.stack_base: int = 0
         self.page_size: int | None = None
-        self.inst_count: int = 0
-        self.curr_instr_size: int = 0
         self.disasm_eng: Any = None
         self.builtin_hooks_set: bool = False
         self.emu_eng: unicorn_eng.EmuEngine | None = None
@@ -74,8 +71,6 @@ class BinaryEmulator(MemoryManager, ABC):
         self.profiler: Profiler = Profiler()
 
         self.runtime: float = 0
-
-        self.emu_version = self.get_emu_version()
 
     def get_profiler(self) -> Profiler:
         """
@@ -284,19 +279,42 @@ class BinaryEmulator(MemoryManager, ABC):
         """
         return self.disasm(self.mem_read(addr, size), addr, fast)
 
-    def set_func_args(self, stack_addr, ret_addr, *args, home_space=True):
+    def set_func_args(self, stack_addr, ret_addr, *args, conv, home_space=True):
         """
-        Set the arguments before an emulated function call. This is how we pass
-        arguments to a function when calling it through the emulator.
+        Set the arguments before an emulated function call.
+
+        Lays out *args* according to *conv* and the current architecture,
+        writes *ret_addr* at the top of the resulting stack frame, and
+        updates the stack-pointer register.
+
+        On x86 fastcall the first two arguments go into ECX/EDX; on x64
+        the first four go into RCX/RDX/R8/R9.  Remaining arguments are
+        pushed onto the stack.  On x64 a 32-byte shadow (home) space is
+        reserved above the return address when *home_space* is True.
+
+        Args:
+            stack_addr: Base address of the stack region.
+            ret_addr: Return address to place on the stack.
+            *args: Argument values to pass to the callee.
+            conv: Calling convention (e.g. ``CALL_CONV_STDCALL``).
+            home_space: Reserve 32-byte x64 shadow space (default True).
         """
-        curr_sp = stack_addr - self.ptr_size
         nargs = len(args)
+        curr_sp = stack_addr
 
         if self.get_arch() == e_arch.ARCH_X86:
-            sp = e_arch.X86_REG_ESP
+            sp_reg = e_arch.X86_REG_ESP
+
+            if conv == e_arch.CALL_CONV_FASTCALL:
+                for r in (e_arch.X86_REG_ECX, e_arch.X86_REG_EDX):
+                    if nargs == 0:
+                        break
+                    self.reg_write(r, args[len(args) - nargs])
+                    nargs -= 1
+
         elif self.get_arch() == e_arch.ARCH_AMD64:
-            sp = e_arch.AMD64_REG_RSP
-            i = 0
+            sp_reg = e_arch.AMD64_REG_RSP
+
             for i, r in enumerate(
                 (e_arch.AMD64_REG_RCX, e_arch.AMD64_REG_RDX, e_arch.AMD64_REG_R8, e_arch.AMD64_REG_R9)
             ):
@@ -304,25 +322,20 @@ class BinaryEmulator(MemoryManager, ABC):
                     break
                 self.reg_write(r, args[i])
                 nargs -= 1
-            # Set the stack home space
-            if home_space:
-                curr_sp -= 0x20
-            self.reg_write(sp, curr_sp)
         else:
             raise EmuException("Unsupported architecture")
 
         if nargs > 0:
             for arg in args[-nargs:][::-1]:
-                a = arg.to_bytes(self.ptr_size, byteorder="little")
-
-                self.mem_write(curr_sp, a)
-                self.reg_write(sp, curr_sp)
                 curr_sp -= self.ptr_size
+                self.mem_write(curr_sp, arg.to_bytes(self.ptr_size, byteorder="little"))
 
-        # Set the return address
-        r = ret_addr.to_bytes(self.ptr_size, byteorder="little")
-        self.mem_write(curr_sp, r)
-        self.reg_write(sp, curr_sp)
+        if self.get_arch() == e_arch.ARCH_AMD64 and home_space:
+            curr_sp -= 0x20
+
+        curr_sp -= self.ptr_size
+        self.mem_write(curr_sp, ret_addr.to_bytes(self.ptr_size, byteorder="little"))
+        self.reg_write(sp_reg, curr_sp)
 
     def get_func_argv(self, callconv, argc):
         """
@@ -480,40 +493,6 @@ class BinaryEmulator(MemoryManager, ABC):
         elif self.get_arch() == e_arch.ARCH_AMD64:
             self.reg_write(e_arch.AMD64_REG_RSP, addr)
 
-    def format_stack(self, num_ptrs):
-        """
-        Get the stack and format it for display
-        """
-        out: list[tuple] = []
-        sp = self.get_stack_ptr()
-        for i in range(num_ptrs):
-            try:
-                ptr = self.mem_read(sp, self.get_ptr_size())
-            except Exception:
-                return out
-            ptr = int.from_bytes(ptr, "little")
-            tag = self.get_address_tag(ptr)
-            out.append((sp, ptr, tag))
-            sp += self.get_ptr_size()
-        return out
-
-    def print_stack(self, num_ptrs):
-        """
-        This a debug function used to print the current stack state
-        """
-        ptrs = self.format_stack(num_ptrs)
-        print("Stack:")
-        print("***********************")
-        for p in ptrs:
-            sp, ptr, tag = p
-            if tag:
-                fmt = f"sp=0x{sp:x}:\t0x{ptr:x}\t->\t{tag}"
-            else:
-                fmt = f"sp=0x{sp:x}:\t0x{ptr:x}\t"
-
-            print(fmt.expandtabs(5))
-            sp += self.get_ptr_size()
-
     def get_stack_trace(self, num_ptrs=16):
         """
         Get the current stack state
@@ -574,6 +553,43 @@ class BinaryEmulator(MemoryManager, ABC):
             raise EmuException("Unsupported architecture")
         return val
 
+    def reset_cpu_context(self):
+        """
+        Zero general-purpose registers and reset EFLAGS to the default value (0x2).
+
+        Does NOT touch SP, BP, or IP — those are managed by reset_stack / run setup.
+        """
+        arch = self.get_arch()
+        if arch == e_arch.ARCH_X86:
+            for reg in (
+                e_arch.X86_REG_EAX,
+                e_arch.X86_REG_EBX,
+                e_arch.X86_REG_ECX,
+                e_arch.X86_REG_EDX,
+                e_arch.X86_REG_ESI,
+                e_arch.X86_REG_EDI,
+            ):
+                self.reg_write(reg, 0)
+        elif arch == e_arch.ARCH_AMD64:
+            for reg in (
+                e_arch.AMD64_REG_RAX,
+                e_arch.AMD64_REG_RBX,
+                e_arch.AMD64_REG_RCX,
+                e_arch.AMD64_REG_RDX,
+                e_arch.AMD64_REG_RSI,
+                e_arch.AMD64_REG_RDI,
+                e_arch.AMD64_REG_R8,
+                e_arch.AMD64_REG_R9,
+                e_arch.AMD64_REG_R10,
+                e_arch.AMD64_REG_R11,
+                e_arch.AMD64_REG_R12,
+                e_arch.AMD64_REG_R13,
+                e_arch.AMD64_REG_R14,
+                e_arch.AMD64_REG_R15,
+            ):
+                self.reg_write(reg, 0)
+        self.reg_write(e_arch.X86_REG_EFLAGS, 0x2)
+
     def reset_stack(self, base):
         """
         Reset stack to the supplied base address
@@ -582,8 +598,10 @@ class BinaryEmulator(MemoryManager, ABC):
         ptr = base
 
         if arch == e_arch.ARCH_X86:
-            self.reg_write(e_arch.X86_REG_ESP, base)
-            self.reg_write(e_arch.X86_REG_EBP, base)
+            # Save room for stack arguments beyond the ones a run supplies
+            ptr -= self.ptr_size * 64
+            self.reg_write(e_arch.X86_REG_ESP, ptr)
+            self.reg_write(e_arch.X86_REG_EBP, ptr)
         elif arch == e_arch.ARCH_AMD64:
             # Save room for the "home space"
             ptr -= self.ptr_size * 5
@@ -600,7 +618,7 @@ class BinaryEmulator(MemoryManager, ABC):
         # Stack grows down
         chunk = self.get_valid_ranges(size, addr=0x1200000)
         addr, block_size = chunk
-        self.mem_map(block_size, base=addr, tag="emu.stack")
+        self.mem_map(block_size, base=addr, tag="emu.stack", perms=common.PERM_MEM_RW)
 
         base = addr + block_size
         self.mem_reserve(size, base=base)
@@ -634,25 +652,6 @@ class BinaryEmulator(MemoryManager, ABC):
         Get the current emulated architecture
         """
         return self.arch
-
-    def get_arch_name(self):
-        """
-        Get the name of current emulated architecture
-        """
-        if self.arch == e_arch.ARCH_AMD64:
-            return "amd64"
-        elif self.arch == e_arch.ARCH_X86:
-            return "x86"
-        return ""
-
-    def eval_emu_var(self):
-        """
-        Used to expand variables supplied in the emulator config file. This
-        might be useful for accessing files that are a relative path of the
-        speakeasy package.
-        For example:
-            $ROOT$: This variable corresponds to the package root for speakeasy
-        """
 
     def read_mem_string(self, address, width=1, max_chars=0):
         """
@@ -918,6 +917,12 @@ class BinaryEmulator(MemoryManager, ABC):
 
         return hook
 
+    def remove_code_hook(self, hook):
+        """Remove a hook that add_code_hook returned"""
+        if hook.added:
+            self.emu_eng.hook_remove(hook.handle)
+        self.hooks[common.HOOK_CODE].remove(hook)
+
     def _fire_dyn_code_hooks(self, addr):
         profiler = self.get_profiler()
         mm = self.get_address_map(addr)
@@ -1039,10 +1044,15 @@ class BinaryEmulator(MemoryManager, ABC):
 
         return hook
 
+    def _intercept_api_trap(self, access, address, size):
+        return False
+
     def _hook_mem_invalid_dispatch(self, emu, access, address, size, value):
         """
         This handler will dispatch other invalid memory hooks
         """
+        if self._intercept_api_trap(access, address, size):
+            return False
         hl = self.hooks.get(common.HOOK_MEM_INVALID, [])
 
         rv = True

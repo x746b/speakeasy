@@ -26,6 +26,44 @@ Entry-point highlights:
 - `dropped_files`: populated from filesystem manager fully-written files.
 - `memory`: populated from run-end memory/module capture, with optional region payload refs when `snapshot_memory_regions=true`.
 
+An `api` event records its arguments in `args`, a list of objects with `name`, `type`, `value`,
+and `display`. When the signature database declares the function and its prototype consumes
+the same argument slots as the call, `args` has one entry per parameter, with the parameter
+name in `name` and `display` rendered from the declared type. Strings are decoded, enums and
+flags are symbolic, and struct pointers are expanded. Without a usable signature, `args` has
+one entry per argument slot, `name` is absent, and `display` is the hex value. `type` tells a
+consumer how to read `display`.
+
+| Type | `display` |
+|---|---|
+| `int` | hex integer |
+| `ptr` | address in hex (also null, out-only, and unreadable pointers) |
+| `handle` | handle value in hex |
+| `str` | decoded string, without quotes |
+| `bool` | `TRUE` or `FALSE` |
+| `enum` | one member name |
+| `flags` | member names joined by `\|`, with a hex remainder for unknown bits |
+| `struct` | `{field: value, ...}` display text, which is not JSON |
+| `bytes` | hex dump of a by-value struct with no known layout |
+| `guid` | `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` |
+| `float` | decimal number |
+| `text` | a value that a handler decoded itself |
+
+`value` holds the raw integer the caller passed, so a consumer can match a flag or constant
+without parsing `display`. A parameter that uses two argument slots on x86 (a 64-bit integer,
+for example) has the combined value. For a call served by a handler, a value the handler
+decoded itself (such as the key path behind a registry handle) replaces the `display` of that
+parameter, and `value` still holds what the caller passed. An entry that a variadic handler
+adds, such as the formatted output of `printf`, has no `value`.
+
+Every event carries `pos`, the position of the actor that performed the operation, so an
+event always sits in the timeline of the thread that caused it. Process-scoped events
+(`mem_alloc`, `mem_write`, `mem_read`, `mem_protect`, `mem_free`, `thread_create`,
+`thread_inject`, `process_create`) also carry the target process as a `pid` payload. That
+payload is omitted for purely local operations, so a populated `pid` means the operation
+crossed a process boundary. Thread events still report `tid` for the created or injected
+thread, even for a local create.
+
 ## Report fields to recipe flags
 
 - top-level `strings` is controlled by `--analysis-strings` / `--no-analysis-strings` ([recipe](cli-analysis-recipes.md#recipe-analysis-strings)).
@@ -40,7 +78,7 @@ Entry-point highlights:
 ```jsonc
 {
   // Report format version.
-  "report_version": "3.0.0",
+  "report_version": "5.0.0",
 
   // Total wall-clock runtime in seconds.
   "emulation_total_runtime": 1.234,
@@ -116,53 +154,61 @@ Entry-point highlights:
           "pos": {"tick": 10, "tid": 2000, "pid": 1337, "pc": 4198400},
           "event": "api",
           "api_name": "kernel32.LoadLibraryA",
-          "args": ["ws2_32"],
+          // "name" is present when the API signature is known.
+          "args": [{"name": "lpLibFileName", "type": "str", "value": 4206732, "display": "ws2_32"}],
           "ret_val": "0x78c00000"
         },
         {
           "pos": {"tick": 20, "tid": 2000, "pid": 1337, "pc": 4198410},
           "event": "process_create",
           "path": "C:\\Windows\\System32\\cmd.exe",
-          "cmdline": "cmd.exe /c whoami"
+          "cmdline": "cmd.exe /c whoami",
+          "pid": 4200
         },
         {
-          "pos": {"tick": 30, "tid": 2000, "pid": 4242, "pc": 4198420},
+          // Cross-process: the actor (pid 1337) allocates inside pid 4242.
+          "pos": {"tick": 30, "tid": 2000, "pid": 1337, "pc": 4198420},
           "event": "mem_alloc",
           "path": "C:\\Windows\\System32\\notepad.exe",
           "base": "0x10000000",
           "size": "0x1000",
-          "protect": "PAGE_EXECUTE_READWRITE"
+          "protect": "PAGE_EXECUTE_READWRITE",
+          "pid": 4242
         },
         {
-          "pos": {"tick": 40, "tid": 2000, "pid": 4242, "pc": 4198430},
+          "pos": {"tick": 40, "tid": 2000, "pid": 1337, "pc": 4198430},
           "event": "mem_write",
           "path": "C:\\Windows\\System32\\notepad.exe",
           "base": "0x10000000",
           "size": 16,
-          "data_ref": "data-mem-write"
+          "data_ref": "data-mem-write",
+          "pid": 4242
         },
         {
-          "pos": {"tick": 50, "tid": 2000, "pid": 4242, "pc": 4198440},
+          "pos": {"tick": 50, "tid": 2000, "pid": 1337, "pc": 4198440},
           "event": "mem_read",
           "path": "C:\\Windows\\System32\\notepad.exe",
           "base": "0x10000000",
           "size": 16,
-          "data_ref": "data-mem-read"
+          "data_ref": "data-mem-read",
+          "pid": 4242
         },
         {
-          "pos": {"tick": 60, "tid": 2000, "pid": 4242, "pc": 4198450},
+          // Local: no pid payload, so the target is the actor's own process.
+          "pos": {"tick": 60, "tid": 2000, "pid": 1337, "pc": 4198450},
           "event": "mem_protect",
-          "path": "C:\\Windows\\System32\\notepad.exe",
-          "base": "0x10000000",
+          "path": "C:\\Windows\\System32\\sample.exe",
+          "base": "0x401000",
           "size": "0x1000",
           "protect": "PAGE_EXECUTE_READ"
         },
         {
-          "pos": {"tick": 70, "tid": 2000, "pid": 4242, "pc": 4198460},
+          "pos": {"tick": 70, "tid": 2000, "pid": 1337, "pc": 4198460},
           "event": "mem_free",
           "path": "C:\\Windows\\System32\\notepad.exe",
           "base": "0x10000000",
-          "size": "0x1000"
+          "size": "0x1000",
+          "pid": 4242
         },
         {
           "pos": {"tick": 80, "tid": 2000, "pid": 1337, "pc": 4198470},
@@ -173,18 +219,22 @@ Entry-point highlights:
           "size": "0x1a000"
         },
         {
-          "pos": {"tick": 90, "tid": 2000, "pid": 4242, "pc": 4198480},
+          // Local thread creation keeps the new tid but carries no pid payload.
+          "pos": {"tick": 90, "tid": 2000, "pid": 1337, "pc": 4198480},
           "event": "thread_create",
-          "path": "C:\\Windows\\System32\\notepad.exe",
-          "start_addr": "0x10000000",
-          "param": "0x0"
+          "path": "C:\\Windows\\System32\\sample.exe",
+          "start_addr": "0x401500",
+          "param": "0x0",
+          "tid": 2100
         },
         {
-          "pos": {"tick": 100, "tid": 2000, "pid": 4242, "pc": 4198490},
+          "pos": {"tick": 100, "tid": 2000, "pid": 1337, "pc": 4198490},
           "event": "thread_inject",
           "path": "C:\\Windows\\System32\\notepad.exe",
           "start_addr": "0x10000000",
-          "param": "0x0"
+          "param": "0x0",
+          "pid": 4242,
+          "tid": 4300
         },
         {
           "pos": {"tick": 110, "tid": 2000, "pid": 1337, "pc": 4198500},
@@ -373,7 +423,7 @@ Entry-point highlights:
 
 ```json
 {
-  "report_version": "3.0.0",
+  "report_version": "5.0.0",
   "emulation_total_runtime": 0.012,
   "timestamp": 1760000000,
   "arch": "x86",
@@ -397,7 +447,7 @@ Entry-point highlights:
 ```jsonc
 {
   // Report schema version.
-  "report_version": "3.0.0",
+  "report_version": "5.0.0",
 
   // Total runtime in seconds for this emulation session.
   "emulation_total_runtime": 0.012,

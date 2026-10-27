@@ -145,37 +145,6 @@ class MemoryManager:
                 self.mem_unmap(mm.block_base, mm.block_size)
                 [self.maps.remove(mm) for mm in ml]  # type: ignore[func-returns-value]  # list comp used for side effect
 
-    def mem_remap(self, frm, to):
-        """
-        Remap a block of emulated memory, and return the new address,
-        or -1 on error
-        Protections remain the same
-        """
-        map = self.get_address_map(frm)
-
-        if not map:
-            return -1
-
-        prot = map.prot
-        size = map.size
-
-        # Exclude old memory region in tag name
-        tag = map.tag[: map.tag.rfind(".")]
-
-        contents = self.mem_read(map.base, size)
-
-        # Will unmap as well
-        self.mem_free(map.base)
-
-        newmem = self.mem_map(size, base=to, perms=prot, tag=tag)
-
-        if newmem != to:
-            return -1
-
-        self.mem_write(newmem, contents)
-
-        return newmem
-
     def mem_unmap(self, base, size):
         """
         Free a block of emulated memory
@@ -253,15 +222,6 @@ class MemoryManager:
         self.mem_reserves.append(mm)
         return base
 
-    def purge_memory(self):
-        """
-        Unmap all current blocks of mapped memory
-        """
-        for region in self.get_mem_regions():
-            base, end, perms = region
-            size = (end - base) + 1
-            self._mem_unmap_region(base, size)
-
     def get_mem_maps(self):
         """
         Get the listing of current memory maps
@@ -275,7 +235,8 @@ class MemoryManager:
         for r in self.mem_reserves:
             if mapped_base == r.base:
                 self.mem_reserves.remove(r)
-                return self.mem_map(r.size, base=r.base, perms=r.prot, tag=r.tag)
+                perms = common.PERM_MEM_RWX if r.prot is None else r.prot
+                return self.mem_map(r.size, base=r.base, perms=perms, tag=r.tag)
         return None
 
     def get_mem_regions(self):

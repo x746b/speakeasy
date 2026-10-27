@@ -29,17 +29,16 @@ class Wininet(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs: dict[str, Any] = {}
         self.data: dict[str, Any] = {}
         self.win: Any | None = None
-        self.netman = netman.NetworkManager(config=emu.config.network)
+        self.netman = netman.NetworkManager(emu.handle_allocator, config=emu.config.network)
         super().__get_hook_attrs__(self)
 
     @apihook("InternetOpen", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def InternetOpen(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetOpen(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void InternetOpenA(
           LPTSTR lpszAgent,
@@ -49,26 +48,25 @@ class Wininet(api.ApiHandler):
           DWORD  dwFlags
         );
         """
-        ctx = ctx or {}
         ua, access, proxy, bypass, flags = argv
 
         cw = self.get_char_width(ctx)
         if ua:
             ua = self.read_mem_string(ua, cw)
-            argv[0] = ua
+            ctx.args["lpszAgent"].display = ua
         if proxy:
             proxy = self.read_mem_string(proxy, cw)
-            argv[2] = proxy
+            ctx.args["lpszProxy"].display = proxy
         if bypass:
             bypass = self.read_mem_string(bypass, cw)
-            argv[3] = bypass
+            ctx.args["lpszProxyBypass"].display = bypass
 
         conn = self.netman.new_wininet_inst(ua, access, proxy, bypass, flags)
         hnd = conn.get_handle()
         return hnd
 
     @apihook("InternetConnect", argc=8, conv=_arch.CALL_CONV_STDCALL)
-    def InternetConnect(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetConnect(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void InternetConnect(
           HINTERNET     hInternet,
@@ -81,19 +79,18 @@ class Wininet(api.ApiHandler):
           DWORD_PTR     dwContext
         );
         """
-        ctx = ctx or {}
         hnd, server, port, user, password, service, flags, dwctx = argv
 
         cw = self.get_char_width(ctx)
         if server:
             server = self.read_mem_string(server, cw)
-            argv[1] = server
+            ctx.args["lpszServerName"].display = server
         if user:
             user = self.read_mem_string(user, cw)
-            argv[3] = user
+            ctx.args["lpszUserName"].display = user
         if password:
             password = self.read_mem_string(password, cw)
-            argv[4] = password
+            ctx.args["lpszPassword"].display = password
 
         wini = self.netman.get_wininet_object(hnd)
 
@@ -105,7 +102,7 @@ class Wininet(api.ApiHandler):
         return hdl
 
     @apihook("HttpOpenRequest", argc=8, conv=_arch.CALL_CONV_STDCALL)
-    def HttpOpenRequest(self, emu, argv, ctx: api.ApiContext = None):
+    def HttpOpenRequest(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void HttpOpenRequest(
           HINTERNET hConnect,
@@ -118,25 +115,24 @@ class Wininet(api.ApiHandler):
           DWORD_PTR dwContext
         );
         """
-        ctx = ctx or {}
         hnd, verb, objname, ver, ref, accepts, flags, dwctx = argv
 
         cw = self.get_char_width(ctx)
         if verb:
             verb = self.read_mem_string(verb, cw)
-            argv[1] = verb
+            ctx.args["lpszVerb"].display = verb
         if objname:
             objname = self.read_mem_string(objname, cw)
-            argv[2] = objname
+            ctx.args["lpszObjectName"].display = objname
         if ver:
             ver = self.read_mem_string(ver, cw)
-            argv[3] = ver
+            ctx.args["lpszVersion"].display = ver
         if ref:
             ref = self.read_mem_string(ref, cw)
-            argv[4] = ref
+            ctx.args["lpszReferrer"].display = ref
 
         defs = windefs.get_flag_defines(flags)
-        argv[6] = " | ".join(defs)
+        ctx.args["dwFlags"].display = " | ".join(defs)
 
         sess = self.netman.get_wininet_object(hnd)
         req = sess.new_request(verb, objname, ver, ref, accepts, defs, dwctx)
@@ -144,7 +140,7 @@ class Wininet(api.ApiHandler):
         return hdl
 
     @apihook("InternetCrackUrl", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def InternetCrackUrl(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetCrackUrl(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetCrackUrl(
             LPCSTR            lpszUrl,
@@ -153,7 +149,6 @@ class Wininet(api.ApiHandler):
             LPURL_COMPONENTSA lpUrlComponents
         );
         """
-        ctx = ctx or {}
         lpszUrl, dwUrlLength, dwFlags, lpUrlComponents = argv
 
         rv = False
@@ -161,7 +156,7 @@ class Wininet(api.ApiHandler):
 
         if lpszUrl and lpUrlComponents:
             url = self.read_mem_string(lpszUrl, cw)
-            argv[0] = url
+            ctx.args["lpszUrl"].display = url
             rv = True
 
             uc = windefs.URL_COMPONENTS(emu.get_ptr_size())
@@ -172,23 +167,33 @@ class Wininet(api.ApiHandler):
                 url_comp.nScheme = windefs.INTERNET_SCHEME_HTTPS
             elif crack.scheme == "http":
                 url_comp.nScheme = windefs.INTERNET_SCHEME_HTTP
-            if url_comp.dwHostNameLength > 0:
-                if url_comp.lpszHostName:
-                    host = crack.netloc + "\x00"
-                    enc = self.get_encoding(cw)
-                    self.mem_write(url_comp.lpszHostName, host.encode(enc))
+            port, parts = windefs.crack_url(url)
+            if not url_comp.dwExtraInfoLength:
+                path_start = parts["UrlPath"][1]
+                parts["UrlPath"] = (url[path_start:], path_start)
+            url_comp.nPort = port
+            for part, (text, offset) in parts.items():
+                length = getattr(url_comp, f"dw{part}Length")
+                if not length:
+                    continue
+                buf = getattr(url_comp, f"lpsz{part}")
+                if buf:
+                    if length <= len(text):
+                        setattr(url_comp, f"dw{part}Length", len(text) + 1)
+                        self.mem_write(lpUrlComponents, url_comp.get_bytes())
+                        emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                        return False
+                    self.write_mem_string(text, buf, cw)
                 else:
-                    offset = url.find(crack.netloc)
-                    ptr = lpszUrl + (offset * cw)
-                    url_comp.lpszHostName = ptr
-                    url_comp.dwHostNameLength = len(crack.netloc)
+                    setattr(url_comp, f"lpsz{part}", lpszUrl + offset * cw)
+                setattr(url_comp, f"dw{part}Length", len(text))
 
             self.mem_write(lpUrlComponents, url_comp.get_bytes())
 
         return rv
 
     @apihook("InternetSetOption", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def InternetSetOption(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetSetOption(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetSetOption(
           HINTERNET hInternet,
@@ -204,7 +209,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("InternetGetConnectedState", argc=2, conv=_arch.CALL_CONV_STDCALL)
-    def InternetGetConnectedState(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetGetConnectedState(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetGetConnectedState(
           LPDWORD lpdwFlags,
@@ -218,12 +223,12 @@ class Wininet(api.ApiHandler):
 
         if lpdwFlags:
             self.mem_write(lpdwFlags, flags.to_bytes(4, "little"))
-            argv[0] = "INTERNET_CONNECTION_LAN"
+            ctx.args["lpdwFlags"].display = "INTERNET_CONNECTION_LAN"
 
         return rv
 
     @apihook("HttpSendRequest", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def HttpSendRequest(self, emu, argv, ctx: api.ApiContext = None):
+    def HttpSendRequest(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI HttpSendRequest(
           HINTERNET hRequest,
@@ -233,7 +238,6 @@ class Wininet(api.ApiHandler):
           DWORD     dwOptionalLength
         );
         """
-        ctx = ctx or {}
         hnd, headers, hdrlen, lpOptional, dwOptionalLength = argv
 
         body = b""
@@ -241,7 +245,7 @@ class Wininet(api.ApiHandler):
         cw = self.get_char_width(ctx)
         if headers:
             headers = self.read_mem_string(headers, cw)
-            argv[1] = headers
+            ctx.args["lpszHeaders"].display = headers
 
         if lpOptional:
             body = self.mem_read(lpOptional, dwOptionalLength)
@@ -260,7 +264,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("InternetErrorDlg", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def InternetErrorDlg(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetErrorDlg(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void InternetErrorDlg(
           HWND      hWnd,
@@ -275,7 +279,7 @@ class Wininet(api.ApiHandler):
         return
 
     @apihook("InternetQueryOption", argc=4)
-    def InternetQueryOption(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetQueryOption(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetQueryOption(
             HINTERNET hInternet,
@@ -288,7 +292,7 @@ class Wininet(api.ApiHandler):
         rv = False
         opt = windefs.get_option_define(dwOption)
         if opt:
-            argv[1] = opt
+            ctx.args["dwOption"].display = opt
 
         if dwOption == windefs.INTERNET_OPTION_SECURITY_FLAGS:
             if lpBuffer:
@@ -299,7 +303,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("InternetReadFile", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def InternetReadFile(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetReadFile(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetReadFile(
           HINTERNET hFile,
@@ -325,7 +329,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("HttpQueryInfo", argc=5)
-    def HttpQueryInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def HttpQueryInfo(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI HttpQueryInfo(
             HINTERNET hRequest,
@@ -335,33 +339,39 @@ class Wininet(api.ApiHandler):
             LPDWORD   lpdwIndex
         );
         """
-        ctx = ctx or {}
         hRequest, dwInfoLevel, lpBuffer, lpdwBufferLength, lpdwIndex = argv
         cw = self.get_char_width(ctx)
 
-        rv = False
-        info_str = windefs.get_header_query(dwInfoLevel)
+        header_id = dwInfoLevel & windefs.HTTP_QUERY_HEADER_MASK
+        as_number = bool(dwInfoLevel & windefs.WINHTTP_QUERY_FLAG_NUMBER)
+        info_str = windefs.get_header_query(header_id)
         if info_str:
-            argv[1] = info_str
+            if as_number:
+                info_str += " | WINHTTP_QUERY_FLAG_NUMBER"
+            ctx.args["dwInfoLevel"].display = info_str
+
+        if header_id == windefs.WINHTTP_QUERY_STATUS_CODE:
+            if as_number:
+                out = int(windefs.HTTP_STATUS_OK).to_bytes(4, "little")
+                out_len = len(out)
+            else:
+                out = (windefs.HTTP_STATUS_OK + "\x00").encode(self.get_encoding(cw))
+                out_len = len(out) - cw
+            if not lpBuffer or int.from_bytes(self.mem_read(lpdwBufferLength, 4), "little") < len(out):
+                self.mem_write(lpdwBufferLength, len(out).to_bytes(4, "little"))
+                emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                return False
+            self.mem_write(lpBuffer, out)
+            self.mem_write(lpdwBufferLength, out_len.to_bytes(4, "little"))
+            return True
+
         if not lpBuffer:
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-        if windefs.WINHTTP_QUERY_STATUS_CODE == dwInfoLevel:
-            if lpBuffer:
-                buf_len = self.mem_read(lpdwBufferLength, 4)
-                buf_len = int.from_bytes(buf_len, "little")
 
-                if cw == 2:
-                    enc = "utf-16le"
-                elif cw == 1:
-                    enc = "utf-8"
-                out = windefs.HTTP_STATUS_OK.encode(enc)
-                self.mem_write(lpBuffer, out)
-                rv = True
-
-        return rv
+        return False
 
     @apihook("InternetQueryDataAvailable", argc=4)
-    def InternetQueryDataAvailable(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetQueryDataAvailable(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetQueryDataAvailable(
             HINTERNET hFile,
@@ -383,7 +393,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("InternetCloseHandle", argc=1)
-    def InternetCloseHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetCloseHandle(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOLAPI InternetCloseHandle(
             HINTERNET hInternet
@@ -397,7 +407,7 @@ class Wininet(api.ApiHandler):
         return rv
 
     @apihook("InternetOpenUrl", argc=6)
-    def InternetOpenUrl(self, emu, argv, ctx: api.ApiContext = None):
+    def InternetOpenUrl(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void InternetOpenUrlA(
             HINTERNET hInternet,
@@ -408,18 +418,19 @@ class Wininet(api.ApiHandler):
             DWORD_PTR dwContext
         );
         """
-        ctx = ctx or {}
         hInternet, lpszUrl, lpszHeaders, dwHeadersLength, dwFlags, dwContext = argv
         cw = self.get_char_width(ctx)
-        if lpszUrl:
-            url = self.read_mem_string(lpszUrl, cw)
-            argv[1] = url
+        if not lpszUrl:
+            return 0
+        url = self.read_mem_string(lpszUrl, cw)
+        ctx.args["lpszUrl"].display = url
+        headers = ""
         if lpszHeaders:
             headers = self.read_mem_string(lpszHeaders, cw)
-            argv[2] = headers
+            ctx.args["lpszHeaders"].display = headers
 
         defs = windefs.get_flag_defines(dwFlags)
-        argv[4] = " | ".join(defs)
+        ctx.args["dwFlags"].display = " | ".join(defs)
 
         wini = self.netman.get_wininet_object(hInternet)
         if not wini:
@@ -430,7 +441,7 @@ class Wininet(api.ApiHandler):
             port = 80
         else:
             port = 443
-        self.record_http_event(crack.netloc, port, headers=lpszHeaders)
+        self.record_http_event(crack.netloc, port, headers=headers)
         sess = wini.new_session(crack.netloc, port, "", "", "", defs, dwContext)
         if not sess:
             return 0

@@ -1,12 +1,71 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
-import shlex
 from typing import Any
 
+import speakeasy.winenv.defs.windows.com as com
 import speakeasy.winenv.defs.windows.shell32 as shell32_defs
 import speakeasy.winenv.defs.windows.windows as windefs
 from speakeasy.profiler_events import PROC_CREATE
 
 from .. import api
+
+
+def split_command_line(cmdline: str) -> list[str]:
+    """
+    Split a command line with the rules of CommandLineToArgvW. The program
+    name ends at the next quote or whitespace, without escapes. In later
+    arguments, 2n backslashes and a quote give n backslashes and toggle
+    quoting, 2n+1 backslashes and a quote give n backslashes and a literal
+    quote, and other backslashes are literal. In a run of quotes, every
+    third quote is a literal quote, as in Wine CommandLineToArgvW.
+    """
+    blank = " \t"
+    if cmdline.startswith('"'):
+        end = cmdline.find('"', 1)
+        end = len(cmdline) if end == -1 else end
+        args = [cmdline[1:end]]
+        end += 1
+    else:
+        end = next((i for i, c in enumerate(cmdline) if c in blank), len(cmdline))
+        args = [cmdline[:end]]
+
+    arg: list[str] = []
+    started = False
+    quotes = backslashes = 0
+    i = end
+    while i < len(cmdline):
+        c = cmdline[i]
+        i += 1
+        if c == "\\":
+            backslashes += 1
+            started = True
+            continue
+        if c == '"':
+            arg.append("\\" * (backslashes // 2))
+            if backslashes % 2:
+                arg.append('"')
+            else:
+                quotes += 1
+            while i < len(cmdline) and cmdline[i] == '"':
+                i += 1
+                quotes += 1
+                if quotes == 3:
+                    arg.append('"')
+                    quotes = 0
+            if quotes == 2:
+                quotes = 0
+            started = True
+        elif c in blank and not quotes:
+            arg.append("\\" * backslashes)
+            if started:
+                args.append("".join(arg))
+            arg, started = [], False
+        else:
+            arg.append("\\" * backslashes + c)
+            started = True
+        backslashes = 0
+    if started:
+        args.append("".join(arg) + "\\" * backslashes)
+    return args
 
 
 class Shell32(api.ApiHandler):
@@ -19,7 +78,6 @@ class Shell32(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs: dict[str, Any] = {}
@@ -36,7 +94,7 @@ class Shell32(api.ApiHandler):
         return self.curr_handle
 
     @apihook("SHCreateDirectoryEx", argc=3)
-    def SHCreateDirectoryEx(self, emu, argv, ctx: api.ApiContext = None):
+    def SHCreateDirectoryEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int SHCreateDirectoryExA(
             HWND                      hwnd,
@@ -44,22 +102,20 @@ class Shell32(api.ApiHandler):
             const SECURITY_ATTRIBUTES *psa
         );
         """
-        ctx = ctx or {}
-
         hwnd, pszPath, psa = argv
 
         cw = self.get_char_width(ctx)
         dn = ""
         if pszPath:
             dn = self.read_mem_string(pszPath, cw)
-            argv[1] = dn
+            ctx.args["pszPath"].display = dn
 
             self.record_file_access_event(dn, "directory_create")
 
         return 0
 
     @apihook("ShellExecute", argc=6)
-    def ShellExecute(self, emu, argv, ctx: api.ApiContext = None):
+    def ShellExecute(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HINSTANCE ShellExecuteA(
             HWND   hwnd,
@@ -70,8 +126,6 @@ class Shell32(api.ApiHandler):
             INT    nShowCmd
         );
         """
-        ctx = ctx or {}
-
         hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd = argv
 
         cw = self.get_char_width(ctx)
@@ -81,16 +135,16 @@ class Shell32(api.ApiHandler):
         dn = ""
         if lpOperation:
             op = self.read_mem_string(lpOperation, cw)
-            argv[1] = op
+            ctx.args["lpOperation"].display = op
         if lpFile:
             fn = self.read_mem_string(lpFile, cw)
-            argv[2] = fn
+            ctx.args["lpFile"].display = fn
         if lpParameters:
             param = self.read_mem_string(lpParameters, cw)
-            argv[3] = param
+            ctx.args["lpParameters"].display = param
         if lpDirectory:
             dn = self.read_mem_string(lpDirectory, cw)
-            argv[4] = dn
+            ctx.args["lpDirectory"].display = dn
 
         if dn and fn:
             fn = f"{dn}\\{fn}"
@@ -101,13 +155,12 @@ class Shell32(api.ApiHandler):
         return 33
 
     @apihook("ShellExecuteEx", argc=1)
-    def ShellExecuteEx(self, emu, argv, ctx: api.ApiContext = None):
+    def ShellExecuteEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ShellExecuteExA(
             [in, out] SHELLEXECUTEINFOA *pExecInfo
         );
         """
-        ctx = ctx or {}
         (lpShellExecuteInfo,) = argv
 
         sei = shell32_defs.SHELLEXECUTEINFOA(emu.get_ptr_size())
@@ -120,7 +173,7 @@ class Shell32(api.ApiHandler):
         return True
 
     @apihook("SHChangeNotify", argc=4)
-    def SHChangeNotify(self, emu, argv, ctx: api.ApiContext = None):
+    def SHChangeNotify(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void SHChangeNotify(
             LONG wEventId,
@@ -132,14 +185,14 @@ class Shell32(api.ApiHandler):
         return
 
     @apihook("IsUserAnAdmin", argc=0, ordinal=680)
-    def IsUserAnAdmin(self, emu, argv, ctx: api.ApiContext = None):
+    def IsUserAnAdmin(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsUserAnAdmin();
         """
         return emu.config.user.is_admin
 
     @apihook("SHGetMalloc", argc=1)
-    def SHGetMalloc(self, emu, argv, ctx: api.ApiContext = None):
+    def SHGetMalloc(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SHSTDAPI SHGetMalloc(
             IMalloc **ppMalloc
@@ -149,19 +202,20 @@ class Shell32(api.ApiHandler):
 
         if ppMalloc:
             ci = emu.com.get_interface(emu, emu.get_ptr_size(), "IMalloc")
-            self.mem_write(ppMalloc, ci.address.to_bytes(emu.get_ptr_size(), "little"))
+            pv = self.mem_alloc(emu.get_ptr_size(), tag="emu.COM.pv_IMalloc")
+            self.mem_write(pv, ci.address.to_bytes(emu.get_ptr_size(), "little"))
+            self.mem_write(ppMalloc, pv.to_bytes(emu.get_ptr_size(), "little"))
         rv = windefs.S_OK
         return rv
 
     @apihook("CommandLineToArgv", argc=2)
-    def CommandLineToArgv(self, emu, argv, ctx: api.ApiContext = None):
+    def CommandLineToArgv(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPWSTR * CommandLineToArgv(
             LPCWSTR lpCmdLine,
             int     *pNumArgs
         );
         """
-        ctx = ctx or {}
         cmdline, argc = argv
 
         cw = self.get_char_width(ctx)
@@ -169,7 +223,7 @@ class Shell32(api.ApiHandler):
 
         ptrsize = emu.get_ptr_size()
 
-        split = shlex.split(cl)
+        split = split_command_line(cl)
         nargs = len(split)
 
         # Get the total size we need
@@ -198,7 +252,7 @@ class Shell32(api.ApiHandler):
         return buf
 
     @apihook("ExtractIcon", argc=3)
-    def ExtractIcon(self, emu, argv, ctx: api.ApiContext = None):
+    def ExtractIcon(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HICON ExtractIconA(
           HINSTANCE hInst,
@@ -210,7 +264,7 @@ class Shell32(api.ApiHandler):
         return self.get_handle()
 
     @apihook("SHGetFolderPath", argc=5)
-    def SHGetFolderPath(self, emu, argv, ctx: api.ApiContext = None):
+    def SHGetFolderPath(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HWND   hwnd,
         int    csidl,
@@ -218,10 +272,10 @@ class Shell32(api.ApiHandler):
         DWORD  dwFlags,
         LPWSTR pszPath
         """
-        ctx = ctx or {}
         hwnd, csidl, hToken, dwFlags, pszPath = argv
+        csidl &= ~shell32_defs.CSIDL_FLAG_MASK
         if csidl in shell32_defs.CSIDL:
-            argv[1] = shell32_defs.CSIDL[csidl]
+            ctx.args["csidl"].display = shell32_defs.CSIDL[csidl]
         if csidl == 0x1A:
             # CSIDL_APPDATA
             path = f"C:\\Users\\{emu.config.user.name}\\AppData\\Roaming"
@@ -301,3 +355,26 @@ class Shell32(api.ApiHandler):
 
         emu.write_mem_string(path, pszPath, self.get_char_width(ctx))
         return 0
+
+    @apihook("SHGetKnownFolderPath", argc=4)
+    def SHGetKnownFolderPath(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT SHGetKnownFolderPath(
+          REFKNOWNFOLDERID rfid,
+          DWORD            dwFlags,
+          HANDLE           hToken,
+          PWSTR            *ppszPath
+        );
+        """
+        rfid, _flags, _token, ppszPath = argv
+        guid = com.convert_guid_bytes_to_str(self.mem_read(rfid, 16)).strip("{}")
+        folder = shell32_defs.KNOWN_FOLDERS.get(guid)
+        ctx.args["rfid"].display = folder[0] if folder else guid
+        ptr = 0
+        if folder:
+            path = (folder[1].format(user=emu.config.user.name) + "\x00").encode("utf-16le")
+            ptr = self.mem_alloc(len(path), tag="api.SHGetKnownFolderPath")
+            self.mem_write(ptr, path)
+        if ppszPath:
+            self.mem_write(ppszPath, ptr.to_bytes(emu.get_ptr_size(), "little"))
+        return windefs.S_OK if folder else windefs.E_FILE_NOT_FOUND

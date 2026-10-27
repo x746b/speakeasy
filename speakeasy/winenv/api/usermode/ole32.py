@@ -16,7 +16,6 @@ class Ole32(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
         self.funcs = {}
         self.data = {}
@@ -25,7 +24,7 @@ class Ole32(api.ApiHandler):
         self.names = {}
 
     @apihook("OleInitialize", argc=1)
-    def OleInitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def OleInitialize(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT OleInitialize(
             IN LPVOID pvReserved
@@ -37,7 +36,7 @@ class Ole32(api.ApiHandler):
         return rv
 
     @apihook("CoInitialize", argc=1)
-    def CoInitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitialize(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitialize(
           LPVOID pvReserved
@@ -49,7 +48,7 @@ class Ole32(api.ApiHandler):
         return rv
 
     @apihook("CoInitializeEx", argc=2)
-    def CoInitializeEx(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitializeEx(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitializeEx(
           LPVOID pvReserved,
@@ -62,13 +61,13 @@ class Ole32(api.ApiHandler):
         return rv
 
     @apihook("CoUninitialize", argc=0)
-    def CoUninitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def CoUninitialize(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void CoUninitialize();
         """
 
     @apihook("CoInitializeSecurity", argc=9)
-    def CoInitializeSecurity(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitializeSecurity(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitializeSecurity(
           PSECURITY_DESCRIPTOR        pSecDesc,
@@ -87,16 +86,16 @@ class Ole32(api.ApiHandler):
 
         authn_level = com.get_define_int(argv[4])
         if authn_level:
-            argv[4] = authn_level
+            ctx.args["dwAuthnLevel"].display = authn_level
 
         imp_level = com.get_define_int(argv[5])
         if imp_level:
-            argv[5] = imp_level
+            ctx.args["dwImpLevel"].display = imp_level
 
         return rv
 
     @apihook("CoCreateInstance", argc=5)
-    def CoCreateInstance(self, emu, argv, ctx: api.ApiContext = None):
+    def CoCreateInstance(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoCreateInstance(
           REFCLSID  rclsid,
@@ -113,26 +112,30 @@ class Ole32(api.ApiHandler):
         clsid_str = com.convert_guid_bytes_to_str(clsid_bytes)
         clsid_name = com.get_clsid(clsid_str)
         if clsid_name:
-            argv[0] = clsid_name
+            ctx.args["rclsid"].display = clsid_name
             riid_bytes = self.mem_read(riid, self.sizeof(windefs.GUID()))
             riid_str = com.convert_guid_bytes_to_str(riid_bytes)
             iid_name = com.get_iid(riid_str)
             if iid_name:
-                argv[3] = iid_name
+                ctx.args["riid"].display = iid_name
                 if ppv:
                     ci = emu.com.get_interface(emu, emu.get_ptr_size(), iid_name.replace("IID_", ""))
                     pv = self.mem_alloc(emu.get_ptr_size(), tag=f"emu.COM.pv_{iid_name}")
                     self.mem_write(pv, ci.address.to_bytes(emu.get_ptr_size(), "little"))
                     self.mem_write(ppv, pv.to_bytes(emu.get_ptr_size(), "little"))
-            else:
-                logger.info("Unsupported COM IID %s", riid)
+                return rv
+            logger.info("Unsupported COM IID %s", riid_str)
+            rv = com.E_NOINTERFACE
         else:
             logger.info("Unsupported COM CLSID %s", clsid_str)
+            rv = com.REGDB_E_CLASSNOTREG
 
+        if ppv:
+            self.mem_write(ppv, b"\x00" * emu.get_ptr_size())
         return rv
 
     @apihook("CoSetProxyBlanket", argc=8)
-    def CoSetProxyBlanket(self, emu, argv, ctx: api.ApiContext = None):
+    def CoSetProxyBlanket(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoSetProxyBlanket(
             IUnknown                 *pProxy,
@@ -145,10 +148,10 @@ class Ole32(api.ApiHandler):
             DWORD                    dwCapabilities
         );
         """
-        return 1
+        return windefs.S_OK
 
     @apihook("StringFromCLSID", argc=2)
-    def StringFromCLSID(self, emu, argv, ctx: api.ApiContext = None):
+    def StringFromCLSID(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT StringFromCLSID(
         REFCLSID rclsid,
@@ -161,10 +164,11 @@ class Ole32(api.ApiHandler):
 
         guid = self.mem_read(rclsid, self.sizeof(windefs.GUID()))
         u = com.convert_guid_bytes_to_str(guid)
-        argv[1] = u
+        ctx.args["lplpsz"].display = u
         u = (u + "\x00").encode("utf-16le")
 
         ptr = self.mem_alloc(len(u), tag="api.StringFromCLSID")
+        self.mem_write(ptr, u)
 
         if lplpsz:
             self.mem_write(lplpsz, ptr.to_bytes(emu.get_ptr_size(), "little"))
@@ -172,7 +176,7 @@ class Ole32(api.ApiHandler):
         return rv
 
     @apihook("CoCreateGuid", argc=1)
-    def CoCreateGuid(self, emu, argv, ctx: api.ApiContext = None):
+    def CoCreateGuid(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         pguid = argv[0]
         guid_bytes = b"\xde\xad\xc0\xde\xbe\xef\xca\xfe\xba\xbe\x01\x23\x45\x67\x89\xab"
         if pguid:

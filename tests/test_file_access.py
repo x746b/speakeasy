@@ -24,13 +24,13 @@ def test_file_access(config, load_test_bin, run_test, bin_file):
     create_file = get_api_calls(driver_entry, "ntdll.NtCreateFile")
     assert len(create_file) == 1
     create_file = create_file[0]
-    assert create_file.args[3] == "\\??\\c:\\myfile.txt"
+    assert create_file.args[2].display == "\\??\\c:\\myfile.txt"
 
     read_file = get_api_calls(driver_entry, "ntdll.NtReadFile")
     assert len(read_file) == 1
 
-    printf = get_api_calls(driver_entry, "api-ms-win-crt-stdio-l1-1-0.__stdio_common_vfprintf")
+    printf = get_api_calls(driver_entry, "msvcrt.__stdio_common_vfprintf")
     assert len(printf) == 5
     printf = printf[-1]
 
-    assert "File contained:" in printf.args[2]
+    assert "File contained:" in printf.args[2].display

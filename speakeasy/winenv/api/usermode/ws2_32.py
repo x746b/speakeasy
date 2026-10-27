@@ -26,13 +26,11 @@ class Ws2_32(api.ApiHandler):
     impdata = api.ApiHandler.impdata
 
     def __init__(self, emu):
-
         super().__init__(emu)
 
         self.funcs: dict[str, Any] = {}
         self.data: dict[str, Any] = {}
-        self.addr_bufs: dict[int, int] = {}
-        self.last_error: int = 0
+        self.addr_bufs: dict[str, int] = {}
         self.win: Any | None = None
         self.netman = emu.get_network_manager()
         self.wstypes = wstypes
@@ -40,7 +38,7 @@ class Ws2_32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("WSAStartup", argc=2, conv=_arch.CALL_CONV_STDCALL, ordinal=115)
-    def WSAStartup(self, emu, argv, ctx: api.ApiContext = None):
+    def WSAStartup(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAStartup(
           WORD      wVersionRequired,
@@ -49,13 +47,14 @@ class Ws2_32(api.ApiHandler):
         """
         ver, lpWSAData = argv
 
-        wsa = self.wstypes.WSAData(emu.get_ptr_size())
-        data = self.mem_cast(wsa, lpWSAData)
+        data = self.wstypes.WSAData(emu.get_ptr_size())
 
-        data.wVersion = 0x0101
+        data.wVersion = 0x0202 if (ver & 0xFF, (ver >> 8) & 0xFF) >= (2, 2) else ver
         data.wHighVersion = 0x0202
         data.iMaxSockets = 0x1000
         data.iMaxUdpDg = 0x1000
+        data.szDescription = b"WinSock 2.0"
+        data.szSystemStatus = b"Running"
 
         self.mem_write(lpWSAData, self.get_bytes(data))
 
@@ -63,7 +62,7 @@ class Ws2_32(api.ApiHandler):
         return rv
 
     @apihook("WSACleanup", argc=0, ordinal=116)
-    def WSACleanup(self, emu, argv, ctx: api.ApiContext = None):
+    def WSACleanup(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSACleanup();
         """
@@ -71,7 +70,7 @@ class Ws2_32(api.ApiHandler):
         return 0
 
     @apihook("WSASocket", argc=6)
-    def WSASocket(self, emu, argv, ctx: api.ApiContext = None):
+    def WSASocket(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SOCKET WSAAPI WSASocket(
           int                 af,
@@ -91,13 +90,13 @@ class Ws2_32(api.ApiHandler):
 
         fd = sock.fd
 
-        argv[0] = fam_str
-        argv[1] = sock_str
+        ctx.args["af"].display = fam_str
+        ctx.args["type"].display = sock_str
 
         return fd
 
     @apihook("WSAIoctl", argc=9, conv=_arch.CALL_CONV_STDCALL)
-    def WSAIoctl(self, emu, argv, ctx: api.ApiContext = None):
+    def WSAIoctl(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI WSAIoctl(
           SOCKET                             s,
@@ -117,7 +116,7 @@ class Ws2_32(api.ApiHandler):
         return windefs.ERROR_SUCCESS
 
     @apihook("WSAConnect", argc=7, conv=_arch.CALL_CONV_STDCALL)
-    def WSAConnect(self, emu, argv, ctx: api.ApiContext = None):
+    def WSAConnect(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI WSAConnect(
             SOCKET         s,
@@ -129,14 +128,12 @@ class Ws2_32(api.ApiHandler):
             LPQOS          lpGQOS
         );
         """
-        ctx = ctx or {}
-
         # TODO: Add actual function logic. However, for now, just call connect()
 
         return self.connect(emu, argv[:3], ctx)
 
     @apihook("socket", argc=3, conv=_arch.CALL_CONV_STDCALL, ordinal=23)
-    def socket(self, emu, argv, ctx: api.ApiContext = None):
+    def socket(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SOCKET WSAAPI socket(
           int af,
@@ -153,33 +150,33 @@ class Ws2_32(api.ApiHandler):
 
         fd = sock.fd
 
-        argv[0] = fam_str
-        argv[1] = sock_str
+        ctx.args["af"].display = fam_str
+        ctx.args["type"].display = sock_str
 
         return fd
 
     @apihook("inet_addr", argc=1, ordinal=11)
-    def inet_addr(self, emu, argv, ctx: api.ApiContext = None):
+    def inet_addr(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         unsigned long inet_addr(
           _In_ const char *cp
         );
         """
         (a,) = argv
+        rv = INADDR_NONE
 
         if a:
             a = self.read_mem_string(a, 1)
-            argv[0] = a
+            ctx.args["cp"].display = a
             try:
-                rv = inet_aton(a)
-                rv = int.from_bytes(rv, "little")
+                rv = int.from_bytes(inet_aton(a), "little")
             except OSError:
                 rv = INADDR_NONE
 
         return rv
 
     @apihook("htons", argc=1, conv=_arch.CALL_CONV_STDCALL, ordinal=9)
-    def htons(self, emu, argv, ctx: api.ApiContext = None):
+    def htons(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         u_short htons(
           u_short hostshort
@@ -192,7 +189,7 @@ class Ws2_32(api.ApiHandler):
         return netshort
 
     @apihook("ntohs", argc=1, ordinal=15)
-    def ntohs(self, emu, argv, ctx: api.ApiContext = None):
+    def ntohs(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         u_short ntohs(
             u_short netshort
@@ -203,7 +200,7 @@ class Ws2_32(api.ApiHandler):
         return ntohs(netshort)
 
     @apihook("ntohl", argc=1, ordinal=14)
-    def ntohl(self, emu, argv, ctx: api.ApiContext = None):
+    def ntohl(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         u_long ntohl(
             u_long netlong
@@ -214,7 +211,7 @@ class Ws2_32(api.ApiHandler):
         return ntohl(netlong)
 
     @apihook("setsockopt", argc=5, ordinal=21)
-    def setsockopt(self, emu, argv, ctx: api.ApiContext = None):
+    def setsockopt(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int setsockopt(
           SOCKET     s,
@@ -229,20 +226,20 @@ class Ws2_32(api.ApiHandler):
 
         opt_level = winsock.get_define(level, "SOL_")
         if opt_level:
-            argv[1] = opt_level
+            ctx.args["level"].display = opt_level
 
         opt_name = winsock.get_define(optname, "SO_")
         if opt_name:
-            argv[2] = opt_name
+            ctx.args["optname"].display = opt_name
 
         if opt_name == "SO_RCVBUF" or opt_name == "SO_SNDBUF":
             opt_val = self.mem_read(optval, optlen)
-            argv[3] = struct.unpack("<I", opt_val)[0]
+            ctx.args["optval"].display = hex(struct.unpack("<I", opt_val)[0])
 
         return rv
 
     @apihook("WSASetLastError", argc=1, ordinal=112)
-    def WSASetLastError(self, emu, argv, ctx: api.ApiContext = None):
+    def WSASetLastError(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void WSASetLastError(
             int iError
@@ -250,11 +247,18 @@ class Ws2_32(api.ApiHandler):
         """
         (iError,) = argv
 
-        self.last_error = iError
+        emu.set_last_error(iError)
         return
 
+    @apihook("WSAGetLastError", argc=0, ordinal=111)
+    def WSAGetLastError(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int WSAGetLastError();
+        """
+        return emu.get_last_error() or 0
+
     @apihook("gethostname", argc=2, ordinal=57)
-    def gethostname(self, emu, argv, ctx: api.ApiContext = None):
+    def gethostname(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int gethostname(
             char *name,
@@ -270,14 +274,14 @@ class Ws2_32(api.ApiHandler):
         host = emu.config.hostname
         if name and host:
             host += "\x00"
-            if namelen > len(host):
+            if namelen >= len(host):
                 out = host.encode("utf-8")
                 self.mem_write(name, out)
                 rv = 0
         return rv
 
     @apihook("gethostbyname", argc=1, conv=_arch.CALL_CONV_STDCALL, ordinal=52)
-    def gethostbyname(self, emu, argv, ctx: api.ApiContext = None):
+    def gethostbyname(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         struct hostent * gethostbyname(const char FAR * name);
         """
@@ -313,13 +317,13 @@ class Ws2_32(api.ApiHandler):
         else:
             ip = ""
 
-        argv[0] = name
+        ctx.args["name"].display = name
         self.record_dns_event(name, ip)
 
         return ptr_hostent
 
     @apihook("connect", argc=3, conv=_arch.CALL_CONV_STDCALL, ordinal=4)
-    def connect(self, emu, argv, ctx: api.ApiContext = None):
+    def connect(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI connect(
           SOCKET         s,
@@ -340,7 +344,8 @@ class Ws2_32(api.ApiHandler):
 
         socket = self.netman.get_socket(s)
         if not socket:
-            return 0xFFFFFFFF
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
         stype = socket.type
         proto = "unknown"
         if stype == "SOCK_STREAM":
@@ -354,12 +359,12 @@ class Ws2_32(api.ApiHandler):
 
         self.record_network_event(raddr, rport, typ="connect", proto=proto, method="winsock.connect")
 
-        argv[1] = f"{raddr}:{rport}"
+        ctx.args["name"].display = f"{raddr}:{rport}"
 
         return rv
 
     @apihook("bind", argc=3, ordinal=2)
-    def bind(self, emu, argv, ctx: api.ApiContext = None):
+    def bind(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int bind(
             SOCKET         s,
@@ -376,6 +381,9 @@ class Ws2_32(api.ApiHandler):
         rport = ntohs(sa.sin_port)
 
         socket = self.netman.get_socket(s)
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
         stype = socket.type
         proto = "unknown"
         if stype == "SOCK_STREAM":
@@ -388,12 +396,12 @@ class Ws2_32(api.ApiHandler):
         socket.set_connection_info(raddr, rport)
         self.record_network_event(raddr, rport, typ="bind", proto=proto, method="winsock.bind")
 
-        argv[1] = f"{raddr}:{rport}"
+        ctx.args["name"].display = f"{raddr}:{rport}"
 
         return rv
 
     @apihook("listen", argc=2, ordinal=13)
-    def listen(self, emu, argv, ctx: api.ApiContext = None):
+    def listen(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI listen(
             SOCKET s,
@@ -406,7 +414,7 @@ class Ws2_32(api.ApiHandler):
         return rv
 
     @apihook("select", argc=5, ordinal=18)
-    def select(self, emu, argv, ctx: api.ApiContext = None):
+    def select(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI select(
             int           nfds,
@@ -419,25 +427,17 @@ class Ws2_32(api.ApiHandler):
         nfds, readfds, writefds, exceptfds, timeout = argv
         fd_count = 0
 
-        if readfds:
-            fds = self.mem_read(readfds, 4)
-            fds = int.from_bytes(fds, "little")
-            fd_count += fds
-
-        if writefds:
-            fds = self.mem_read(writefds, 4)
-            fds = int.from_bytes(fds, "little")
-            fd_count += fds
+        for fds in (readfds, writefds):
+            if fds:
+                fd_count += int.from_bytes(self.mem_read(fds, 4), "little")
 
         if exceptfds:
-            fds = self.mem_read(exceptfds, 4)
-            fds = int.from_bytes(fds, "little")
-            fd_count += fds
+            self.mem_write(exceptfds, b"\x00" * 4)
 
         return fd_count
 
     @apihook("accept", argc=3, ordinal=1)
-    def accept(self, emu, argv, ctx: api.ApiContext = None):
+    def accept(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SOCKET WSAAPI accept(
             SOCKET   s,
@@ -448,6 +448,9 @@ class Ws2_32(api.ApiHandler):
         s, addr, addrlen = argv
 
         socket = self.netman.get_socket(s)
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return self.get_max_int()
         stype = socket.type
         proto = "unknown"
         if stype == "SOCK_STREAM":
@@ -473,29 +476,80 @@ class Ws2_32(api.ApiHandler):
         if addr:
             sockaddr = self.wstypes.sockaddr_in(emu.get_ptr_size())
             sockaddr = self.mem_cast(sockaddr, addr)
+            sockaddr.sin_family = winsock.AF_INET
             sockaddr.sin_addr = nip
-            sockaddr.sin_port = port
+            sockaddr.sin_port = htons(port)
             self.mem_write(addr, sockaddr.get_bytes())
 
         return new_sock.fd
 
+    def write_sockaddr(self, emu, name, namelen, host, port):
+        size = self.wstypes.sockaddr_in(emu.get_ptr_size()).sizeof()
+        if not name or not namelen or int.from_bytes(self.mem_read(namelen, 4), "little") < size:
+            emu.set_last_error(winsock.WSAEFAULT)
+            return winsock.SOCKET_ERROR
+        sockaddr = self.wstypes.sockaddr_in(emu.get_ptr_size())
+        sockaddr.sin_family = winsock.AF_INET
+        sockaddr.sin_addr = int.from_bytes(inet_aton(host), "little")
+        sockaddr.sin_port = htons(port)
+        self.mem_write(name, sockaddr.get_bytes())
+        self.mem_write(namelen, size.to_bytes(4, "little"))
+        return 0
+
+    @apihook("getpeername", argc=3, ordinal=5)
+    def getpeername(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int getpeername(
+            SOCKET   s,
+            sockaddr *name,
+            int      *namelen
+        );
+        """
+        s, name, namelen = argv
+        socket = self.netman.get_socket(s)
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
+        if not socket.connected_host:
+            emu.set_last_error(winsock.WSAENOTCONN)
+            return winsock.SOCKET_ERROR
+        return self.write_sockaddr(emu, name, namelen, socket.connected_host, socket.connected_port)
+
+    @apihook("getsockname", argc=3, ordinal=6)
+    def getsockname(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int getsockname(
+            SOCKET   s,
+            sockaddr *name,
+            int      *namelen
+        );
+        """
+        s, name, namelen = argv
+        socket = self.netman.get_socket(s)
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
+        adapters = emu.config.network.adapters
+        host = next((a.ip_address for a in adapters if a.ip_address), "127.0.0.1")
+        return self.write_sockaddr(emu, name, namelen, host, 49152 + socket.fd % 16384)
+
     @apihook("inet_ntoa", argc=1, ordinal=12)
-    def inet_ntoa(self, emu, argv, ctx: api.ApiContext = None):
+    def inet_ntoa(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char FAR* inet_ntoa(struct in_addr in);
         """
         (in_addr,) = argv
 
         raddr = inet_ntoa(in_addr.to_bytes(4, "little"))
-        rv = self.addr_bufs.get(raddr)
-        if not rv:
-            buf = self.mem_alloc(len(raddr), tag=f"api.ws2_32.inet_ntoa.{raddr}")
-            self.mem_write(buf, raddr.encode("utf-8"))
+        buf = self.addr_bufs.get(raddr)
+        if not buf:
+            buf = self.mem_alloc(len(raddr) + 1, tag=f"api.ws2_32.inet_ntoa.{raddr}")
+            self.mem_write(buf, raddr.encode("utf-8") + b"\0")
             self.addr_bufs.update({raddr: buf})
         return buf
 
-    @apihook("inet_ntop", argc=4, ordinal=180)
-    def inet_ntop(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("inet_ntop", argc=4)
+    def inet_ntop(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PCSTR WSAAPI inet_ntop(
           [in]  INT        Family,
@@ -507,12 +561,12 @@ class Ws2_32(api.ApiHandler):
         family, pAddr, pStringBuf, StringBufSize = argv
 
         fam_str = winsock.get_addr_family(family)
-        argv[0] = fam_str
+        ctx.args["Family"].display = fam_str
 
         # TODO: implement case AF_INET6
         if fam_str == "AF_INET":
             ipv4_bytes = self.mem_read(pAddr, 4)
-            argv[1] = int.from_bytes(ipv4_bytes, "big")
+            ctx.args["pAddr"].display = hex(int.from_bytes(ipv4_bytes, "big"))
             try:
                 ipv4_str = inet_ntop(family, ipv4_bytes)
             except OSError:
@@ -523,8 +577,8 @@ class Ws2_32(api.ApiHandler):
 
         return 0
 
-    @apihook("inet_pton", argc=3, ordinal=181)
-    def inet_pton(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("inet_pton", argc=3)
+    def inet_pton(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         INT WSAAPI inet_pton(
           [in]  INT   Family,
@@ -536,12 +590,12 @@ class Ws2_32(api.ApiHandler):
         family, pszAddrString, pAddrBuf = argv
 
         fam_str = winsock.get_addr_family(family)
-        argv[0] = fam_str
+        ctx.args["Family"].display = fam_str
 
         # TODO: implement case AF_INET6
         if fam_str == "AF_INET":
             ipv4_str = self.read_string(pszAddrString)
-            argv[1] = ipv4_str
+            ctx.args["pszAddrString"].display = ipv4_str
             try:
                 ipv4_bytes = inet_pton(family, ipv4_str)
             except OSError:
@@ -553,7 +607,7 @@ class Ws2_32(api.ApiHandler):
         return 0
 
     @apihook("htonl", argc=1, ordinal=8)
-    def htonl(self, emu, argv, ctx: api.ApiContext = None):
+    def htonl(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         uint32_t htonl(uint32_t hostlong);
         """
@@ -561,7 +615,7 @@ class Ws2_32(api.ApiHandler):
         return htonl(hostlong)
 
     @apihook("__WSAFDIsSet", argc=2, ordinal=151)
-    def __WSAFDIsSet(self, emu, argv, ctx: api.ApiContext = None):
+    def __WSAFDIsSet(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int __WSAFDIsSet(
             SOCKET ,
@@ -569,10 +623,15 @@ class Ws2_32(api.ApiHandler):
         );
         """
         sock, fd_set = argv
-        return 1
+        if not fd_set:
+            return 0
+        ptr_size = emu.get_ptr_size()
+        count = min(int.from_bytes(self.mem_read(fd_set, 4), "little"), 64)
+        fds = self.mem_read(fd_set + ptr_size, count * ptr_size)
+        return int(any(int.from_bytes(fds[i : i + ptr_size], "little") == sock for i in range(0, len(fds), ptr_size)))
 
     @apihook("shutdown", argc=2, ordinal=22)
-    def shutdown(self, emu, argv, ctx: api.ApiContext = None):
+    def shutdown(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int shutdown(
             SOCKET s,
@@ -582,7 +641,7 @@ class Ws2_32(api.ApiHandler):
         return 0
 
     @apihook("recv", argc=4, ordinal=16)
-    def recv(self, emu, argv, ctx: api.ApiContext = None):
+    def recv(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int recv(
           SOCKET s,
@@ -598,6 +657,9 @@ class Ws2_32(api.ApiHandler):
         peek = flags & winsock.MSG_PEEK
 
         sock = self.netman.get_socket(s)
+        if not sock:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
         data = sock.get_recv_data(blen, peek)
         rv = len(data)
 
@@ -618,7 +680,7 @@ class Ws2_32(api.ApiHandler):
         return rv
 
     @apihook("send", argc=4, ordinal=19)
-    def send(self, emu, argv, ctx: api.ApiContext = None):
+    def send(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WSAAPI send(
           SOCKET     s,
@@ -631,6 +693,9 @@ class Ws2_32(api.ApiHandler):
         data = b""
 
         socket = self.netman.get_socket(s)
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
         stype = socket.type
         proto = "unknown"
         if stype == "SOCK_STREAM":
@@ -649,7 +714,7 @@ class Ws2_32(api.ApiHandler):
         return len(data)
 
     @apihook("closesocket", argc=1, ordinal=3)
-    def closesocket(self, emu, argv, ctx: api.ApiContext = None):
+    def closesocket(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int closesocket(
           IN SOCKET s
@@ -661,15 +726,15 @@ class Ws2_32(api.ApiHandler):
 
         socket = self.netman.get_socket(s)
         if not socket:
-            # This isnt a valid socket, return invalid
-            rv = winsock.WSAENOTSOCK
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            rv = winsock.SOCKET_ERROR
         else:
             self.netman.close_socket(s)
 
         return rv
 
     @apihook("ioctlsocket", argc=3, ordinal=10)
-    def ioctlsocket(self, emu, argv, ctx: api.ApiContext = None):
+    def ioctlsocket(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int ioctlsocket(
             SOCKET s,
@@ -678,16 +743,17 @@ class Ws2_32(api.ApiHandler):
         );
         """
         s, cmd, argp = argv
-        rv = winsock.WSAENOTSOCK
 
         socket = self.netman.get_socket(s)
-        if socket:
-            rv = 0
+        if not socket:
+            emu.set_last_error(winsock.WSAENOTSOCK)
+            return winsock.SOCKET_ERROR
+        rv = 0
 
         return rv
 
-    @apihook("getaddrinfo", argc=4, ordinal=178)
-    def getaddrinfo(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("getaddrinfo", argc=4)
+    def getaddrinfo(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         INT WSAAPI getaddrinfo(
           PCSTR           pNodeName,
@@ -699,21 +765,25 @@ class Ws2_32(api.ApiHandler):
         pNodeName, pServiceName, pHints, ppResult = argv
         rv = 0
 
-        host = self.read_string(pNodeName)
-        argv[0] = host
+        host = ""
+        if pNodeName:
+            host = self.read_string(pNodeName)
+            ctx.args["pNodeName"].display = host
 
-        service_name = self.read_string(pServiceName)
-        argv[1] = service_name
-        if service_name.isnumeric():
-            port = int(service_name)
-        else:
-            port = winsock.SERVICE_PORTS.get(service_name)
-
-        if not port:
-            return rv
+        port = 0
+        if pServiceName:
+            service_name = self.read_string(pServiceName)
+            ctx.args["pServiceName"].display = service_name
+            if service_name.isnumeric():
+                port = int(service_name)
+            elif service_name in winsock.SERVICE_PORTS:
+                port = winsock.SERVICE_PORTS[service_name]
+            else:
+                return winsock.WSATYPE_NOT_FOUND
 
         hints_ai = self.wstypes.addrinfo(emu.get_ptr_size())
-        hints_ai = self.mem_cast(hints_ai, pHints)
+        if pHints:
+            hints_ai = self.mem_cast(hints_ai, pHints)
 
         # Handles a specific case where an IP address is converted as part of a URL
         # TODO: handle additional cases
@@ -731,31 +801,31 @@ class Ws2_32(api.ApiHandler):
 
         # Populate sockaddr_in
         sockaddr_in = self.wstypes.sockaddr_in(emu.get_ptr_size())
-        sockaddr_in.sin_family = hints_ai.ai_family
+        sockaddr_in.sin_family = winsock.AF_INET
         sockaddr_in.sin_port = htons(port)
         sockaddr_in.sin_addr = htonl(int(ip_bytes.hex(), 16))
-        p_sockaddr = self.mem_alloc(emu.get_ptr_size())
+        p_sockaddr = self.mem_alloc(sockaddr_in.sizeof(), tag="api.struct.sockaddr_in")
         self.mem_write(p_sockaddr, sockaddr_in.get_bytes())
 
         # Populate addrinfo with sockaddr_in and pHints data
         addrinfo = self.wstypes.addrinfo(emu.get_ptr_size())
         # TODO: Update ai_flags as additional cases are added
         addrinfo.ai_flags = winsock.AI_NUMERICHOST
-        addrinfo.ai_family = hints_ai.ai_family
+        addrinfo.ai_family = winsock.AF_INET
         addrinfo.ai_socktype = hints_ai.ai_socktype
         addrinfo.ai_protocol = hints_ai.ai_protocol
         addrinfo.ai_addrlen = sockaddr_in.sizeof()
         addrinfo.ai_addr = p_sockaddr
 
         # Populate ppResult with addrinfo
-        pResult = self.mem_alloc(emu.get_ptr_size())
+        pResult = self.mem_alloc(addrinfo.sizeof(), tag="api.struct.addrinfo")
         self.mem_write(pResult, addrinfo.get_bytes())
         self.mem_write(ppResult, pResult.to_bytes(emu.get_ptr_size(), "little"))
 
         return rv
 
-    @apihook("freeaddrinfo", argc=1, ordinal=177)
-    def freeaddrinfo(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("freeaddrinfo", argc=1)
+    def freeaddrinfo(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         VOID WSAAPI freeaddrinfo(
           PADDRINFOA pAddrInfo
@@ -766,7 +836,7 @@ class Ws2_32(api.ApiHandler):
         return
 
     @apihook("getsockopt", argc=5, ordinal=7)
-    def getsockopt(self, emu, argv, ctx: api.ApiContext = None):
+    def getsockopt(self, emu, argv, ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int getsockopt(
           SOCKET s,
@@ -781,15 +851,15 @@ class Ws2_32(api.ApiHandler):
 
         opt_level = winsock.get_define(level, "SOL_")
         if opt_level:
-            argv[1] = opt_level
+            ctx.args["level"].display = opt_level
 
         opt_len = self.mem_read(optlen, 4)
         opt_len = struct.unpack("<I", opt_len)[0]
-        argv[4] = opt_len
+        ctx.args["optlen"].display = hex(opt_len)
 
         opt_name = winsock.get_define(optname, "SO_")
         if opt_name:
-            argv[2] = opt_name
+            ctx.args["optname"].display = opt_name
             if opt_name == "SO_RCVBUF" or opt_name == "SO_SNDBUF":
                 opt_val = winsock.SOCK_BUF_SIZE
                 self.mem_write(optval, opt_val.to_bytes(opt_len, "little"))
